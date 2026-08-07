@@ -1,5 +1,6 @@
 package com.realapex.client.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -13,6 +14,7 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class Choice {
 
     /** 序号 */
@@ -38,11 +40,16 @@ public class Choice {
     @Builder
     @NoArgsConstructor
     @AllArgsConstructor
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public static class Delta {
         @JsonProperty("role")
         private String role;
 
         @JsonProperty("content")
         private String content;
+
+        /** 推理/思考内容（DeepSeek-R1、o1 等推理模型专用） */
+        @JsonProperty("reasoning_content")
+        private String reasoningContent;
     }
 }

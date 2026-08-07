@@ -22,6 +22,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.concurrent.Executors;
+import java.util.stream.Stream;
 
 /**
  * {@link AiClient} 的默认实现。
@@ -115,37 +116,77 @@ public class DefaultAiClient implements AiClient {
 
         try {
             HttpRequest httpReq = buildHttpRequest(req);
+            HttpResponse<Stream<String>> httpResp = httpClient.send(
+                    httpReq, HttpResponse.BodyHandlers.ofLines());
+
+            // 检查 HTTP 状态码，非 200 直接报错
+            int status = httpResp.statusCode();
+            if (status != 200) {
+                String errorBody = httpResp.body().reduce("", (a, b) -> a + b);
+                handleHttpStreamError(status, errorBody, httpReq);
+                listener.onError(new AiClientException(
+                        "SSE 流式请求失败, HTTP " + status + ": " + errorBody));
+                return;
+            }
+
             // JDK HttpClient 在虚拟线程中逐行消费 SSE 流
-            httpClient.send(httpReq, HttpResponse.BodyHandlers.ofLines())
-                    .body()
-                    .forEach(line -> {
-                        if (line.startsWith("data: ")) {
-                            String data = line.substring(6);
-                            if ("[DONE]".equals(data)) {
-                                listener.onComplete();
-                                return;
-                            }
-                            try {
-                                AiResponse chunk = objectMapper.readValue(
-                                        data, AiResponse.class);
-                                if (chunk.getChoices() != null && !chunk.getChoices().isEmpty()) {
-                                    var delta = chunk.getChoices().get(0).getDelta();
-                                    if (delta != null && delta.getContent() != null) {
-                                        listener.onChunk(delta.getContent());
-                                    }
+            boolean[] doneReceived = {false};
+            int[] dataLineCount = {0};
+            int[] chunkCount = {0};
+            httpResp.body().forEach(line -> {
+                if (line.startsWith("data: ")) {
+                    String data = line.substring(6).trim();
+                    if ("[DONE]".equals(data)) {
+                        dataLineCount[0]++;
+                        doneReceived[0] = true;
+                        listener.onComplete();
+                        return;
+                    }
+                    dataLineCount[0]++;
+                    try {
+                        AiResponse chunk = objectMapper.readValue(
+                                data, AiResponse.class);
+                        if (chunk.getChoices() != null && !chunk.getChoices().isEmpty()) {
+                            var delta = chunk.getChoices().get(0).getDelta();
+                            if (delta != null) {
+                                if (delta.getContent() != null) {
+                                    chunkCount[0]++;
+                                    listener.onChunk(delta.getContent());
                                 }
-                            } catch (JsonProcessingException e) {
-                                log.debug("SSE 行解析跳过: {}", line);
+                                if (delta.getReasoningContent() != null) {
+                                    chunkCount[0]++;
+                                    listener.onChunk(delta.getReasoningContent());
+                                }
                             }
                         }
-                    });
-            // 如果流正常结束但未收到 [DONE]
-            listener.onComplete();
+                    } catch (JsonProcessingException e) {
+                        log.warn("SSE 行解析跳过: {} - 原因: {}", line, e.getMessage());
+                    }
+                }
+            });
+            log.info("SSE 流结束: {} 行 data, {} 次 onChunk", dataLineCount[0], chunkCount[0]);
+            // 如果流正常结束但未收到 [DONE]（兼容非标准 SSE 实现）
+            if (!doneReceived[0]) {
+                listener.onComplete();
+            }
         } catch (IOException e) {
             listener.onError(new AiClientException("SSE 流式请求失败: " + e.getMessage(), e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             listener.onError(new AiClientException("SSE 请求被中断", e));
+        }
+    }
+
+    /**
+     * 处理流式请求的 HTTP 错误，触发认证失败/超限时的 Key 隔离。
+     */
+    private void handleHttpStreamError(int status, String errorBody, HttpRequest request) {
+        if (status == 401 || status == 402) {
+            String apiKey = request.headers()
+                    .firstValue("Authorization").orElse("unknown")
+                    .replace("Bearer ", "");
+            keySelector.blacklist(apiKey);
+            log.warn("API Key 已隔离 (HTTP {}): {}", status, errorBody);
         }
     }
 

@@ -93,6 +93,10 @@ public class ChatController {
 ### 4. SSE 流式输出（打字机效果）
 
 ```java
+import com.realapex.client.client.StreamListener;
+import com.realapex.client.model.AiRequest;
+import com.realapex.client.model.Message;
+
 @GetMapping("/chat/stream")
 public SseEmitter stream(@RequestParam String prompt) {
     SseEmitter emitter = new SseEmitter(60000L);

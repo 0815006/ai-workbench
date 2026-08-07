@@ -4,7 +4,7 @@ import com.realapex.client.client.AiClient;
 import com.realapex.client.client.impl.DefaultAiClient;
 import com.realapex.client.config.AiConfig;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -16,7 +16,7 @@ import org.springframework.context.annotation.Configuration;
  */
 @Configuration
 @EnableConfigurationProperties(AiSdkProperties.class)
-@ConditionalOnProperty(prefix = "ai.sdk", name = "api-keys")
+@ConditionalOnExpression("!'${ai.sdk.api-keys[0]:}'.isEmpty()")
 public class AiSdkAutoConfiguration {
 
     /**
