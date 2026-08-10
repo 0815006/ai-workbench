@@ -159,11 +159,15 @@ public class ContextTrimmer {
             if ("tool".equals(msg.getRole())) {
                 // 移除 tool 消息，标记其 tool_call_id
                 String toolCallId = msg.getToolCallId();
-                if (toolCallId != null) {
-                    toolCallIdsToRemove.add(toolCallId);
-                }
                 result.remove(i);
                 currentChars -= msgChars;
+
+                // 移除后反向查找：如果前置 assistant(tool_calls) 的
+                // 所有 tool 消息都已被移除，同步移除该 assistant 消息
+                if (toolCallId != null) {
+                    toolCallIdsToRemove.add(toolCallId);
+                    removeOrphanedAssistant(result, toolCallIdsToRemove, i);
+                }
                 // 不递增 i，因为列表缩短了
             } else if ("assistant".equals(msg.getRole()) && msg.getToolCalls() != null) {
                 // 检查此 assistant 消息的所有 tool_call 是否都在待移除列表中
@@ -191,6 +195,31 @@ public class ContextTrimmer {
         }
 
         return result;
+    }
+
+    /**
+     * 移除 tool 消息后，反向查找配对的 assistant(tool_calls) 消息。
+     * 若其所有 tool 结果都已不在列表中，同步移除该 assistant 消息，
+     * 防止出现"assistant with tool_calls without tool results"的非法消息序列。
+     *
+     * @param result               当前消息列表
+     * @param toolCallIdsToRemove  已被标记移除的 tool_call_id 集合
+     * @param fromIndex            从哪个索引开始反向查找（即刚被移除的 tool 消息的原位置）
+     */
+    private void removeOrphanedAssistant(List<Message> result,
+                                          Set<String> toolCallIdsToRemove,
+                                          int fromIndex) {
+        for (int j = fromIndex - 1; j >= 0; j--) {
+            Message candidate = result.get(j);
+            if ("assistant".equals(candidate.getRole()) && candidate.getToolCalls() != null) {
+                boolean allToolsRemoved = candidate.getToolCalls().stream()
+                        .allMatch(tc -> toolCallIdsToRemove.contains(tc.getId()));
+                if (allToolsRemoved) {
+                    result.remove(j);
+                }
+                return; // 只处理最近的前置 assistant（一个 tool 只属于一个 assistant）
+            }
+        }
     }
 
     /**
