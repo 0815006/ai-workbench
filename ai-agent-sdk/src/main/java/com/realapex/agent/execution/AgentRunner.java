@@ -8,12 +8,15 @@ import com.realapex.tool.contract.AgentTool;
 import com.realapex.tool.schema.SchemaGenerator;
 import com.realapex.agent.tool.ToolRegistry;
 import com.realapex.client.client.AiClient;
+import com.realapex.client.client.StreamListener;
 import com.realapex.client.model.AiRequest;
 import com.realapex.client.model.AiResponse;
 import com.realapex.client.model.Message;
 import com.realapex.client.model.ToolCall;
 import com.realapex.client.model.ToolDefinition;
 import com.realapex.client.model.Usage;
+import com.realapex.client.stream.StreamEvent;
+import com.realapex.client.stream.StreamToolCallBuffer;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.PrintWriter;
@@ -46,6 +49,12 @@ import java.util.stream.Collectors;
  *   <li>将工具结果拼装为 assistant(tool_calls) + tool_result 消息追加到历史</li>
  *   <li>上下文裁剪检查 → 回到步骤 2</li>
  * </ol>
+ *
+ * <h3>流式模式（默认启用）</h3>
+ * <p>当 {@link AgentRequest#getStream()} 为 true 时，使用
+ * {@link AiClient#streamText} 进行流式 LLM 调用，通过
+ * {@link StreamListener} → {@link AgentEventListener#onChunk(String)} 桥接，
+ * 实现前端打字机效果。</p>
  */
 @Slf4j
 public class AgentRunner {
@@ -59,7 +68,7 @@ public class AgentRunner {
     /**
      * 创建 AgentRunner 实例。
      *
-     * @param aiClient       ai-client-sdk 客户端实例（用于 LLM 通信）
+     * @param aiClient        ai-client-sdk 客户端实例（用于 LLM 通信）
      * @param schemaGenerator JSON Schema 生成器
      */
     public AgentRunner(AiClient aiClient, SchemaGenerator schemaGenerator) {
@@ -86,9 +95,9 @@ public class AgentRunner {
      * <p>当 Agent 完成 ReAct 循环后，SDK 在最后一步自动调用
      * {@link AiClient#generateObject} 将 LLM 最终输出映射为强类型 Java 对象。</p>
      *
-     * @param request      Agent 请求配置
-     * @param outputClass  目标输出类型
-     * @param <T>          目标类型
+     * @param request     Agent 请求配置
+     * @param outputClass 目标输出类型
+     * @param <T>         目标类型
      * @return Agent 执行结果（result.structuredOutput 包含强类型对象）
      * @throws AgentMaxStepsExceededException 达到 maxSteps 仍未完成时抛出
      */
@@ -104,6 +113,7 @@ public class AgentRunner {
         long startTime = System.currentTimeMillis();
         AgentEventListener listener = request.getListener();
         int maxSteps = Math.max(1, request.getMaxSteps());
+        boolean streaming = Boolean.TRUE.equals(request.getStream());
 
         // 构建工具注册表 + ToolDefinition 列表
         ToolRegistry registry = buildRegistry(request.getTools());
@@ -135,58 +145,40 @@ public class AgentRunner {
                 listener.onStepStart(step);
             }
 
-            // === 构建 AiRequest & 调用 LLM ===
-            var aiReqBuilder = AiRequest.builder()
-                    .messages(new ArrayList<>(messages))
-                    .stream(false);
+            // === 构建 AiRequest ===
+            AiRequest aiReq = buildAiRequest(messages, toolDefs, request, streaming);
 
-            if (!toolDefs.isEmpty()) {
-                aiReqBuilder.tools(toolDefs);
-            }
-            if (request.getModel() != null && !request.getModel().isBlank()) {
-                aiReqBuilder.model(request.getModel());
-            }
-            if (request.getTemperature() != null) {
-                aiReqBuilder.temperature(request.getTemperature());
-            }
+            // === 调用 LLM（流式 / 非流式分支） ===
+            List<ToolCall> toolCalls;
+            Usage stepUsage;
+            String stepText;
+            AiResponse aiResponse = null; // 仅非流式模式填充
 
-            AiResponse aiResponse = aiClient.generate(aiReqBuilder.build());
+            if (streaming) {
+                // === 流式模式：StreamListener → AgentEventListener 桥接 ===
+                StreamingCallResult streamResult = executeStreamingCall(aiReq, listener);
+                toolCalls = streamResult.toolCalls();
+                stepText = streamResult.text();
+                stepUsage = streamResult.usage();
+            } else {
+                // === 非流式模式：传统 generate 调用 ===
+                aiResponse = aiClient.generate(aiReq);
+                stepUsage = aiResponse.getUsage();
+                stepText = aiResponse.getText();
+                toolCalls = aiResponse.hasToolCalls() ? aiResponse.getToolCalls() : List.of();
+            }
 
             // === 累计 Usage ===
-            Usage stepUsage = aiResponse.getUsage();
             if (stepUsage != null) {
                 totalPromptTokens += stepUsage.getPromptTokens();
                 totalCompletionTokens += stepUsage.getCompletionTokens();
                 totalTokens += stepUsage.getTotalTokens();
             }
 
-            // === 判断终止条件 ===
-            if (!aiResponse.hasToolCalls() && "stop".equals(aiResponse.getFinishReason())) {
-                // LLM 直接返回最终文本，循环结束
-                finalText = aiResponse.getText();
-
-                // 记录最后一步（无工具调用）
-                AgentStepResult stepResult = AgentStepResult.builder()
-                        .stepNumber(step)
-                        .llmResponse(aiResponse)
-                        .toolCalls(List.of())
-                        .toolResults(Map.of())
-                        .usage(stepUsage)
-                        .durationMs(System.currentTimeMillis() - stepStart)
-                        .build();
-                stepResults.add(stepResult);
-
-                if (listener != null) {
-                    listener.onStepFinish(stepResult);
-                }
-                break;
-            }
-
-            // === 提取工具调用 ===
-            List<ToolCall> toolCalls = aiResponse.getToolCalls();
+            // === 判断终止条件：无工具调用 → LLM 给出最终回答 ===
             if (toolCalls.isEmpty()) {
-                // 没有工具调用也没有 stop——可能是 length 或其他原因
-                finalText = aiResponse.getText();
+                finalText = stepText;
+
                 AgentStepResult stepResult = AgentStepResult.builder()
                         .stepNumber(step)
                         .llmResponse(aiResponse)
@@ -254,7 +246,6 @@ public class AgentRunner {
         // === 结构化输出（如果指定了 outputClass） ===
         if (outputClass != null && finalText != null && !finalText.isBlank()) {
             try {
-                // 使用 ai-client-sdk 的 generateObject 进行结构化提取
                 AiRequest extractionReq = AiRequest.builder()
                         .messages(List.of(
                                 Message.system("从以下文本中提取结构化信息，严格按 JSON Schema 输出。"),
@@ -301,6 +292,91 @@ public class AgentRunner {
         }
 
         return result;
+    }
+
+    // ==================== 流式调用 ====================
+
+    /**
+     * 执行一次流式 LLM 调用，将 {@link StreamListener} 事件桥接到
+     * {@link AgentEventListener}。
+     * <p>此方法是阻塞的——{@link AiClient#streamText} 内部同步处理完整个
+     * SSE 流后才会返回。</p>
+     *
+     * @param request  AI 请求（stream=true）
+     * @param listener Agent 生命周期监听器（可为 null）
+     * @return 流式调用结果（累积文本 + 工具调用 + Token 用量）
+     */
+    private StreamingCallResult executeStreamingCall(AiRequest request, AgentEventListener listener) {
+        StringBuilder textBuilder = new StringBuilder();
+        StreamToolCallBuffer toolCallBuffer = new StreamToolCallBuffer();
+        Usage[] usageHolder = {null};
+
+        aiClient.streamText(request, new StreamListener() {
+            @Override
+            public void onChunk(String chunk) {
+                textBuilder.append(chunk);
+                // 桥接：流式文本增量 → AgentEventListener.onChunk
+                if (listener != null) {
+                    listener.onChunk(chunk);
+                }
+            }
+
+            @Override
+            public void onToolCallChunk(String callId, String name, String argumentsDelta) {
+                toolCallBuffer.accept(new StreamEvent.ToolCallChunk(callId, name, argumentsDelta));
+            }
+
+            @Override
+            public void onUsage(Usage usage) {
+                usageHolder[0] = usage;
+            }
+
+            @Override
+            public void onComplete() {
+                // flush 确保所有累积的工具调用转为完整对象
+                toolCallBuffer.flush();
+            }
+
+            @Override
+            public void onError(Throwable e) {
+                log.error("Agent 流式调用异常", e);
+            }
+        });
+
+        return new StreamingCallResult(
+                textBuilder.toString(),
+                new ArrayList<>(toolCallBuffer.getCompletedCalls()),
+                usageHolder[0]
+        );
+    }
+
+    /**
+     * 流式调用结果——内部数据传输对象。
+     */
+    private record StreamingCallResult(String text, List<ToolCall> toolCalls, Usage usage) {}
+
+    // ==================== 请求构建 ====================
+
+    /**
+     * 构建 AiRequest，合并 AgentRequest 中的模型/温度配置。
+     */
+    private AiRequest buildAiRequest(List<Message> messages, List<ToolDefinition> toolDefs,
+                                     AgentRequest request, boolean streaming) {
+        var builder = AiRequest.builder()
+                .messages(new ArrayList<>(messages))
+                .stream(streaming);
+
+        if (!toolDefs.isEmpty()) {
+            builder.tools(toolDefs);
+        }
+        if (request.getModel() != null && !request.getModel().isBlank()) {
+            builder.model(request.getModel());
+        }
+        if (request.getTemperature() != null) {
+            builder.temperature(request.getTemperature());
+        }
+
+        return builder.build();
     }
 
     // ==================== 内部方法 ====================

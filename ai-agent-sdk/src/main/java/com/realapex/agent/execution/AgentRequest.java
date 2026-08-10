@@ -58,6 +58,10 @@ public class AgentRequest {
     @Builder.Default
     private int maxContextTokens = 8000;
 
+    /** 是否启用流式输出（打字机效果），默认 true。关闭后退化为同步 generate 模式 */
+    @Builder.Default
+    private Boolean stream = true;
+
     /** 结构化输出的目标类型（可选，用于 generateObject 模式） */
     private Class<?> outputClass;
 }
