@@ -37,20 +37,38 @@ public class StreamToolCallBuffer {
     }
 
     private final Map<String, Accumulator> accumulators = new ConcurrentHashMap<>();
+    /** index → callId 映射，用于后续帧仅带 index 不带 callId 时的路由回退 */
+    private final Map<Integer, String> indexToCallId = new ConcurrentHashMap<>();
     private final List<ToolCall> completedCalls = new ArrayList<>();
 
     /**
      * 接收一个工具调用增量事件。
+     * <p>兼容多厂商 SSE 格式差异：首帧通常携带 id + index + name，
+     * 后续 argument 帧可能只带 index 不带 id。本方法建立 index→id 映射，
+     * 确保所有分片都能正确路由到对应的 Accumulator。</p>
      *
      * @param chunk 工具调用增量片段
      */
     public void accept(StreamEvent.ToolCallChunk chunk) {
-        if (chunk.callId() == null) {
-            log.debug("ToolCallChunk with null callId, skipping");
+        String effectiveCallId = chunk.callId();
+
+        // 建立 index → callId 映射（首帧同时带 id 和 index）
+        if (effectiveCallId != null && chunk.index() != null) {
+            indexToCallId.put(chunk.index(), effectiveCallId);
+        }
+
+        // 回退：用 index 查找 callId（后续帧可能只带 index 不带 id）
+        if (effectiveCallId == null && chunk.index() != null) {
+            effectiveCallId = indexToCallId.get(chunk.index());
+        }
+
+        if (effectiveCallId == null) {
+            log.debug("ToolCallChunk 无法路由 (callId={}, index={}), 跳过",
+                    chunk.callId(), chunk.index());
             return;
         }
 
-        Accumulator acc = accumulators.computeIfAbsent(chunk.callId(), k -> new Accumulator());
+        Accumulator acc = accumulators.computeIfAbsent(effectiveCallId, k -> new Accumulator());
 
         // 名称只在有值时更新（首帧带名称，后续帧 name 为 null）
         if (chunk.name() != null && !chunk.name().isEmpty() && !acc.nameReceived) {
@@ -104,6 +122,7 @@ public class StreamToolCallBuffer {
      */
     public void reset() {
         accumulators.clear();
+        indexToCallId.clear();
         completedCalls.clear();
     }
 

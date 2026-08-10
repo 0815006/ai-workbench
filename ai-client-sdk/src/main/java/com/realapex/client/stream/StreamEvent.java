@@ -30,11 +30,13 @@ public sealed interface StreamEvent
     /**
      * 工具调用增量事件。
      *
-     * @param callId         工具调用唯一 ID
+     * @param index          工具调用在列表中的序号（用于关联无 callId 的后续分片）
+     * @param callId         工具调用唯一 ID（首帧出现，后续帧可能为 null）
      * @param name           工具函数名称（首帧出现，后续帧可能为 null）
      * @param argumentsDelta 参数 JSON 增量片段
      */
-    record ToolCallChunk(String callId, String name, String argumentsDelta) implements StreamEvent {
+    record ToolCallChunk(Integer index, String callId, String name, String argumentsDelta)
+            implements StreamEvent {
     }
 
     /**

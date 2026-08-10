@@ -211,7 +211,7 @@ public class DefaultAiClient implements AiClient {
                                             listener.onToolCallChunk(tc.getId(), tc.getName(), tc.getArguments());
                                         }
                                         toolCallBuffer.accept(new StreamEvent.ToolCallChunk(
-                                                tc.getId(), tc.getName(), tc.getArguments()));
+                                                tc.getIndex(), tc.getId(), tc.getName(), tc.getArguments()));
                                     }
                                 }
                             }
@@ -353,7 +353,7 @@ public class DefaultAiClient implements AiClient {
                                         // 内部 Buffer 累积
                                         toolCallBuffer.accept(
                                                 new StreamEvent.ToolCallChunk(
-                                                        callId, name, argsDelta));
+                                                        tc.getIndex(), callId, name, argsDelta));
                                     }
                                 }
                             }

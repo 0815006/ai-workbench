@@ -27,6 +27,10 @@ import lombok.NoArgsConstructor;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class ToolCall {
 
+    /** 工具调用在列表中的序号（SSE 流式分片中用于关联同一调用） */
+    @JsonProperty("index")
+    private Integer index;
+
     /** 工具调用唯一 ID（用于后续 toolResult 关联） */
     @JsonProperty("id")
     private String id;

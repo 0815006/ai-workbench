@@ -3,7 +3,7 @@ package com.realapex.agent.execution;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.realapex.agent.context.ContextTrimmer;
 import com.realapex.agent.event.AgentEventListener;
-import com.realapex.agent.exception.AgentMaxStepsExceededException;
+
 import com.realapex.tool.contract.AgentTool;
 import com.realapex.tool.schema.SchemaGenerator;
 import com.realapex.agent.tool.ToolRegistry;
@@ -79,10 +79,11 @@ public class AgentRunner {
 
     /**
      * 执行 Agent，返回最终文本结果。
+     * <p>达到 maxSteps 时不再抛出异常，而是通过
+     * {@link AgentResult#isMaxStepsExceeded()} 标记超限状态。</p>
      *
      * @param request Agent 请求配置
      * @return Agent 执行结果
-     * @throws AgentMaxStepsExceededException 达到 maxSteps 仍未完成时抛出
      */
     public AgentResult run(AgentRequest request) {
         return doRun(request, null);
@@ -97,7 +98,6 @@ public class AgentRunner {
      * @param outputClass 目标输出类型
      * @param <T>         目标类型
      * @return Agent 执行结果（result.structuredOutput 包含强类型对象）
-     * @throws AgentMaxStepsExceededException 达到 maxSteps 仍未完成时抛出
      */
     @SuppressWarnings("unchecked")
     public <T> AgentResult run(AgentRequest request, Class<T> outputClass) {
@@ -297,9 +297,9 @@ public class AgentRunner {
             listener.onComplete(result);
         }
 
-        // === 熔断 ===
+        // === 熔断（不再抛异常，避免与 onComplete 冲突） ===
         if (maxStepsExceeded) {
-            throw new AgentMaxStepsExceededException(maxSteps, result);
+            log.warn("Agent 达到最大步数限制 ({}), 未能在限制步数内完成最终回答", maxSteps);
         }
 
         return result;
@@ -448,11 +448,21 @@ public class AgentRunner {
                 try {
                     requestObj = requestClass.getDeclaredConstructor().newInstance();
                 } catch (NoSuchMethodException e) {
-                    log.warn("工具 {} 需要参数但 LLM 未提供有效 arguments", toolName);
+                    Map<String, Object> schema = schemaGenerator.generate(requestClass);
+                    String schemaJson;
+                    try {
+                        schemaJson = objectMapper.writeValueAsString(schema);
+                    } catch (Exception ex) {
+                        schemaJson = schema.toString();
+                    }
+                    log.warn("工具 {} 需要参数但 LLM 未提供有效 arguments, argsJson=[{}], schema={}",
+                            toolName, argsJson, schemaJson);
                     return "错误：工具 [" + toolName + "] 需要参数但未提供有效参数 JSON。"
-                            + "请提供符合以下 Schema 的 JSON 参数。";
+                            + "请严格按以下 JSON Schema 格式提供参数：\n"
+                            + schemaJson;
                 }
             } else {
+                log.debug("工具 {} 收到 arguments: {}", toolName, argsJson);
                 requestObj = objectMapper.readValue(argsJson, requestClass);
             }
 
