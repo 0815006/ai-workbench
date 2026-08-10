@@ -1,5 +1,6 @@
 package com.realapex.client.client.impl;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.realapex.client.client.AiClient;
@@ -12,7 +13,11 @@ import com.realapex.client.executor.KeySelector;
 import com.realapex.client.executor.RetryHandler;
 import com.realapex.client.model.AiRequest;
 import com.realapex.client.model.AiResponse;
+import com.realapex.client.model.Choice;
+import com.realapex.client.model.ToolCall;
+import com.realapex.client.model.Usage;
 import com.realapex.client.skill.BaseSkill;
+import com.realapex.client.stream.StreamToolCallBuffer;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -21,13 +26,14 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.Executors;
-import java.util.stream.Stream;
 
 /**
  * {@link AiClient} 的默认实现。
  * <p>基于 JDK 21 原生 {@link HttpClient} + 虚拟线程，零第三方 HTTP 依赖。
- * 内部集成 Key 轮询、指数退避重试、SSE 流式解析、JSON 容错反序列化。</p>
+ * 内部集成 Key 轮询、指数退避重试（含抖动）、SSE 流式解析（含 ToolCall 增量拼接）、
+ * JSON 容错反序列化、多厂商 ToolCall 解析容错。</p>
  *
  * <h3>线程安全</h3>
  * <p>本实现线程安全，可在多线程环境中复用同一个实例。</p>
@@ -49,7 +55,7 @@ public class DefaultAiClient implements AiClient {
      */
     private DefaultAiClient(AiConfig config) {
         this.config = config;
-        this.objectMapper = new ObjectMapper();
+        this.objectMapper = buildObjectMapper();
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(config.getConnectTimeout())
                 .executor(Executors.newVirtualThreadPerTaskExecutor())
@@ -61,6 +67,22 @@ public class DefaultAiClient implements AiClient {
                 config.getMaxRetries(),
                 config.getRetryBaseDelay());
         this.jsonRepairParser = new JsonRepairParser(objectMapper);
+    }
+
+    /**
+     * 构建带多厂商容错配置的 Jackson ObjectMapper。
+     * <ul>
+     *   <li>允许未转义控制字符（兼容 DeepSeek/Qwen 等厂商的 arguments 输出）</li>
+     *   <li>允许单引号（部分厂商非标准 JSON）</li>
+     *   <li>允许不带引号的字段名</li>
+     * </ul>
+     */
+    private static ObjectMapper buildObjectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.configure(JsonParser.Feature.ALLOW_UNQUOTED_CONTROL_CHARS, true);
+        mapper.configure(JsonParser.Feature.ALLOW_SINGLE_QUOTES, true);
+        mapper.configure(JsonParser.Feature.ALLOW_UNQUOTED_FIELD_NAMES, true);
+        return mapper;
     }
 
     /**
@@ -80,10 +102,10 @@ public class DefaultAiClient implements AiClient {
         return new DefaultAiClient(config);
     }
 
-    // ==================== generateText ====================
+    // ==================== generate ====================
 
     @Override
-    public String generateText(AiRequest request) {
+    public AiResponse generate(AiRequest request) {
         AiRequest req = ensureModel(request);
         req.setStream(false);
 
@@ -95,9 +117,10 @@ public class DefaultAiClient implements AiClient {
                 handleHttpError(httpResp);
                 AiResponse aiResp = objectMapper.readValue(
                         httpResp.body(), AiResponse.class);
-                log.debug("generateText 完成, tokens: {}",
+                log.debug("generate 完成, hasToolCalls={}, tokens={}",
+                        aiResp.hasToolCalls(),
                         aiResp.getUsage() != null ? aiResp.getUsage().getTotalTokens() : "N/A");
-                return aiResp.firstText();
+                return aiResp;
             } catch (IOException e) {
                 throw new AiClientException("网络请求失败: " + e.getMessage(), e);
             } catch (InterruptedException e) {
@@ -105,6 +128,13 @@ public class DefaultAiClient implements AiClient {
                 throw new AiClientException("请求被中断", e);
             }
         });
+    }
+
+    // ==================== generateText ====================
+
+    @Override
+    public String generateText(AiRequest request) {
+        return generate(request).getText();
     }
 
     // ==================== streamText ====================
@@ -116,7 +146,7 @@ public class DefaultAiClient implements AiClient {
 
         try {
             HttpRequest httpReq = buildHttpRequest(req);
-            HttpResponse<Stream<String>> httpResp = httpClient.send(
+            HttpResponse<java.util.stream.Stream<String>> httpResp = httpClient.send(
                     httpReq, HttpResponse.BodyHandlers.ofLines());
 
             // 检查 HTTP 状态码，非 200 直接报错
@@ -129,16 +159,19 @@ public class DefaultAiClient implements AiClient {
                 return;
             }
 
-            // JDK HttpClient 在虚拟线程中逐行消费 SSE 流
+            StreamToolCallBuffer toolCallBuffer = new StreamToolCallBuffer();
             boolean[] doneReceived = {false};
             int[] dataLineCount = {0};
             int[] chunkCount = {0};
+
             httpResp.body().forEach(line -> {
                 if (line.startsWith("data: ")) {
                     String data = line.substring(6).trim();
                     if ("[DONE]".equals(data)) {
                         dataLineCount[0]++;
                         doneReceived[0] = true;
+                        // 流结束前 flush 所有未完成的 tool call
+                        flushToolCallBuffer(toolCallBuffer, listener);
                         listener.onComplete();
                         return;
                     }
@@ -146,17 +179,53 @@ public class DefaultAiClient implements AiClient {
                     try {
                         AiResponse chunk = objectMapper.readValue(
                                 data, AiResponse.class);
+
+                        // 提取 usage（通常最后一帧携带）
+                        if (chunk.getUsage() != null) {
+                            listener.onUsage(chunk.getUsage());
+                        }
+
                         if (chunk.getChoices() != null && !chunk.getChoices().isEmpty()) {
-                            var delta = chunk.getChoices().get(0).getDelta();
+                            Choice choice = chunk.getChoices().get(0);
+                            Choice.Delta delta = choice.getDelta();
                             if (delta != null) {
+                                // 文本增量
                                 if (delta.getContent() != null) {
                                     chunkCount[0]++;
                                     listener.onChunk(delta.getContent());
                                 }
+                                // 推理内容增量
                                 if (delta.getReasoningContent() != null) {
                                     chunkCount[0]++;
                                     listener.onChunk(delta.getReasoningContent());
                                 }
+                                // 工具调用增量
+                                if (delta.getToolCalls() != null) {
+                                    for (ToolCall tc : delta.getToolCalls()) {
+                                        String callId = tc.getId();
+                                        String name = tc.getName();
+                                        String argsDelta = tc.getArguments();
+
+                                        // 处理 index-only 的 tool call chunk（部分厂商先发 index 帧）
+                                        if (callId == null && tc.getFunction() == null) {
+                                            continue;
+                                        }
+
+                                        // 通知业务层
+                                        listener.onToolCallChunk(callId, name, argsDelta);
+
+                                        // 内部 Buffer 累积
+                                        toolCallBuffer.accept(
+                                                new com.realapex.client.stream.StreamEvent.ToolCallChunk(
+                                                        callId, name, argsDelta));
+                                    }
+                                }
+                            }
+
+                            // finish_reason 为 tool_calls 时 flush buffer
+                            if ("tool_calls".equals(choice.getFinishReason())
+                                    || "stop".equals(choice.getFinishReason())) {
+                                flushToolCallBuffer(toolCallBuffer, listener);
                             }
                         }
                     } catch (JsonProcessingException e) {
@@ -164,9 +233,11 @@ public class DefaultAiClient implements AiClient {
                     }
                 }
             });
+
             log.info("SSE 流结束: {} 行 data, {} 次 onChunk", dataLineCount[0], chunkCount[0]);
             // 如果流正常结束但未收到 [DONE]（兼容非标准 SSE 实现）
             if (!doneReceived[0]) {
+                flushToolCallBuffer(toolCallBuffer, listener);
                 listener.onComplete();
             }
         } catch (IOException e) {
@@ -174,6 +245,17 @@ public class DefaultAiClient implements AiClient {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             listener.onError(new AiClientException("SSE 请求被中断", e));
+        }
+    }
+
+    /**
+     * Flush StreamToolCallBuffer 中累积的工具调用。
+     */
+    private void flushToolCallBuffer(StreamToolCallBuffer buffer, StreamListener listener) {
+        if (buffer.hasPending()) {
+            buffer.flush();
+            List<ToolCall> completed = buffer.getCompletedCalls();
+            log.debug("SSE ToolCallBuffer flush: {} 个完整 ToolCall", completed.size());
         }
     }
 
@@ -231,6 +313,7 @@ public class DefaultAiClient implements AiClient {
 
     /**
      * 构建 HTTP 请求，自动注入当前轮询到的 API Key。
+     * <p>超时策略：SSE 流式请求使用 readTimeout，同步请求使用 timeout。</p>
      */
     private HttpRequest buildHttpRequest(AiRequest request) {
         String apiKey = keySelector.nextKey();
@@ -241,11 +324,17 @@ public class DefaultAiClient implements AiClient {
             throw new AiClientException("请求序列化失败", e);
         }
 
+        // 流式请求使用 readTimeout（SSE 无数据包最大等待间隔）
+        // 同步请求使用 timeout（完整请求总超时）
+        Duration requestTimeout = Boolean.TRUE.equals(request.getStream())
+                ? config.getReadTimeout()
+                : config.getTimeout();
+
         return HttpRequest.newBuilder()
                 .uri(URI.create(config.getBaseUrl() + CHAT_ENDPOINT))
                 .header("Authorization", "Bearer " + apiKey)
                 .header("Content-Type", "application/json")
-                .timeout(config.getTimeout())
+                .timeout(requestTimeout)
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
     }

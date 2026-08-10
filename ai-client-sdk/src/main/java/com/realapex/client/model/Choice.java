@@ -7,6 +7,8 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.List;
+
 /**
  * 大模型返回的单个选择项。
  */
@@ -21,7 +23,7 @@ public class Choice {
     @JsonProperty("index")
     private int index;
 
-    /** 消息内容 */
+    /** 消息内容（非流式响应） */
     @JsonProperty("message")
     private Message message;
 
@@ -51,5 +53,9 @@ public class Choice {
         /** 推理/思考内容（DeepSeek-R1、o1 等推理模型专用） */
         @JsonProperty("reasoning_content")
         private String reasoningContent;
+
+        /** 工具调用增量片段（SSE 流式 function call 分片） */
+        @JsonProperty("tool_calls")
+        private List<ToolCall> toolCalls;
     }
 }

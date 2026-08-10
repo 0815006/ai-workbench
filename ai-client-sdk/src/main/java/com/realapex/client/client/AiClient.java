@@ -2,12 +2,13 @@ package com.realapex.client.client;
 
 import com.realapex.client.exception.AiClientException;
 import com.realapex.client.model.AiRequest;
+import com.realapex.client.model.AiResponse;
 import com.realapex.client.skill.BaseSkill;
 
 /**
  * AI 大模型通信客户端——顶层通用调用接口。
  * <p>屏蔽不同厂商 API 差异、Key 轮询、重试、SSE 流拼装、JSON 容错等底层复杂性，
- * 只向业务层暴露最干净的文本/对象。</p>
+ * 只向业务层暴露最干净的文本/对象/完整响应。</p>
  *
  * <h3>快速上手</h3>
  * <pre>{@code
@@ -15,10 +16,20 @@ import com.realapex.client.skill.BaseSkill;
  *         .apiKeys(List.of("sk-xxx"))
  *         .build();
  * AiClient client = DefaultAiClient.create(config);
+ *
+ * // 同步文本
  * String reply = client.generateText(
  *         AiRequest.builder()
  *                 .messages(List.of(Message.user("你好")))
  *                 .build());
+ *
+ * // 带工具调用的完整响应
+ * AiResponse resp = client.generate(
+ *         AiRequest.builder()
+ *                 .messages(List.of(Message.user("查询天气")))
+ *                 .tools(List.of(weatherTool))
+ *                 .build());
+ * if (resp.hasToolCalls()) { ... }
  * }</pre>
  */
 public interface AiClient {
@@ -32,6 +43,18 @@ public interface AiClient {
      * @throws AiClientException 网络超时、API Key 失效、响应解析失败时抛出
      */
     String generateText(AiRequest request);
+
+    /**
+     * 同步生成并返回完整响应对象。
+     * <p>相较于 {@link #generateText}，此方法返回完整 {@link AiResponse}，
+     * 包含 tool_calls、usage 等完整元数据，适合 Agent 循环等需要
+     * 判断工具调用与 Token 统计的场景。</p>
+     *
+     * @param request 统一请求对象，不能为空
+     * @return 完整 AiResponse（含 choices、tool_calls、usage）
+     * @throws AiClientException 网络超时、API Key 失效、响应解析失败时抛出
+     */
+    AiResponse generate(AiRequest request);
 
     /**
      * SSE 流式输出。

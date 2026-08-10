@@ -34,6 +34,7 @@ public class AiSdkAutoConfiguration {
                 .model(properties.getModel())
                 .timeout(properties.getTimeout())
                 .connectTimeout(properties.getConnectTimeout())
+                .readTimeout(properties.getReadTimeout())
                 .maxRetries(properties.getMaxRetries())
                 .retryBaseDelay(properties.getRetryBaseDelay())
                 .keyBlacklistDuration(properties.getKeyBlacklistDuration())

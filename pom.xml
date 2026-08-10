@@ -14,6 +14,8 @@
 
     <modules>
         <module>ai-client-sdk</module>
+        <module>ai-tool-sdk</module>
+        <module>ai-agent-sdk</module>
     </modules>
 
     <properties>

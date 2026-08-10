@@ -1,0 +1,1 @@
+- [ai-agent-sdk Implementation](ai-agent-sdk-implementation.md) — ai-agent-sdk module created, ai-client-sdk upgraded with Tool Calling, SSE stream events, and fault tolerance (2026-08-10)

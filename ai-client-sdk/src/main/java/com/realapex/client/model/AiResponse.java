@@ -7,6 +7,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -57,5 +58,61 @@ public class AiResponse {
             return first.getMessage().getContent();
         }
         return "";
+    }
+
+    /**
+     * 获取回复文本（同 {@link #firstText()}）。
+     *
+     * @return 回复文本
+     */
+    public String getText() {
+        return firstText();
+    }
+
+    /**
+     * 大模型是否发起了工具调用请求。
+     *
+     * @return true 如果第一条 choice 包含 tool_calls
+     */
+    public boolean hasToolCalls() {
+        if (choices == null || choices.isEmpty()) {
+            return false;
+        }
+        Choice first = choices.get(0);
+        if (first.getMessage() != null
+                && first.getMessage().getToolCalls() != null
+                && !first.getMessage().getToolCalls().isEmpty()) {
+            return true;
+        }
+        // 也检查 finish_reason
+        return "tool_calls".equals(first.getFinishReason());
+    }
+
+    /**
+     * 获取大模型发起的工具调用列表。
+     *
+     * @return 工具调用列表，无工具调用时返回空列表
+     */
+    public List<ToolCall> getToolCalls() {
+        if (choices == null || choices.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Choice first = choices.get(0);
+        if (first.getMessage() != null && first.getMessage().getToolCalls() != null) {
+            return first.getMessage().getToolCalls();
+        }
+        return Collections.emptyList();
+    }
+
+    /**
+     * 获取第一个 choice 的 finish_reason。
+     *
+     * @return finish_reason 字符串，无 choice 时返回 null
+     */
+    public String getFinishReason() {
+        if (choices == null || choices.isEmpty()) {
+            return null;
+        }
+        return choices.get(0).getFinishReason();
     }
 }

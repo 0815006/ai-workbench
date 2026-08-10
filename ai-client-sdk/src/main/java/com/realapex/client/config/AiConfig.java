@@ -25,13 +25,17 @@ public class AiConfig {
     @Builder.Default
     private String model = "deepseek-chat";
 
-    /** 请求超时时间 */
+    /** 请求总超时时间（涵盖连接 + 读取） */
     @Builder.Default
     private Duration timeout = Duration.ofSeconds(60);
 
-    /** 连接超时时间 */
+    /** 连接超时时间（TCP 握手） */
     @Builder.Default
     private Duration connectTimeout = Duration.ofSeconds(10);
+
+    /** Socket 读取超时（SSE 流无数据包的最大等待间隔），默认 30s */
+    @Builder.Default
+    private Duration readTimeout = Duration.ofSeconds(30);
 
     /** 遇 429/5xx 最大重试次数 */
     @Builder.Default

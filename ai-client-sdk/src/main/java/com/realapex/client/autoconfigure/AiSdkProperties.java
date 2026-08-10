@@ -17,6 +17,7 @@ import java.util.List;
  *     api-keys:
  *       - sk-xxx
  *       - sk-yyy
+ *     read-timeout: 30s
  * </pre>
  */
 @Data
@@ -32,11 +33,14 @@ public class AiSdkProperties {
     /** 默认模型 */
     private String model = "deepseek-chat";
 
-    /** 请求超时 */
+    /** 请求总超时 */
     private Duration timeout = Duration.ofSeconds(60);
 
     /** 连接超时 */
     private Duration connectTimeout = Duration.ofSeconds(10);
+
+    /** Socket 读取超时（SSE 无数据包最大等待间隔） */
+    private Duration readTimeout = Duration.ofSeconds(30);
 
     /** 最大重试次数 */
     private int maxRetries = 3;

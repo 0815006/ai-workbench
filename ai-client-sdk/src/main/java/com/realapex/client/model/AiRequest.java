@@ -12,7 +12,8 @@ import java.util.Map;
 
 /**
  * 大模型统一请求对象，兼容 OpenAI Chat Completions 协议。
- * <p>支持所有 OpenAI 兼容 API 的标准参数，可通过 {@link #extraBody} 扩展厂商特有字段。</p>
+ * <p>支持所有 OpenAI 兼容 API 的标准参数，包含 Tool Calling 与 ToolChoice 策略配置，
+ * 可通过 {@link #extraBody} 扩展厂商特有字段。</p>
  */
 @Data
 @Builder
@@ -52,6 +53,14 @@ public class AiRequest {
     @JsonProperty("stream")
     private Boolean stream;
 
+    /** 可用工具列表（Function Calling） */
+    @JsonProperty("tools")
+    private List<ToolDefinition> tools;
+
+    /** 工具选择策略：auto / none / required / 或指定函数 */
+    @JsonProperty("tool_choice")
+    private Object toolChoice;
+
     /** 扩展字段（厂商特有参数，如 top_k 等） */
     @JsonProperty("extra_body")
     @Builder.Default
@@ -74,4 +83,5 @@ public class AiRequest {
             return ResponseFormat.builder().type("json_object").build();
         }
     }
+
 }
