@@ -15,8 +15,6 @@ import com.realapex.client.model.Message;
 import com.realapex.client.model.ToolCall;
 import com.realapex.client.model.ToolDefinition;
 import com.realapex.client.model.Usage;
-import com.realapex.client.stream.StreamEvent;
-import com.realapex.client.stream.StreamToolCallBuffer;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.PrintWriter;
@@ -44,17 +42,17 @@ import java.util.stream.Collectors;
  * <ol>
  *   <li>构建初始消息列表（system + user + 附加上下文）</li>
  *   <li>调用 LLM → 解析响应</li>
- *   <li>若无 tool_calls 且 finish_reason=stop → 返回最终文本</li>
+ *   <li>若无 tool_calls → 返回最终文本</li>
  *   <li>若有 tool_calls → 虚拟线程并行执行所有工具</li>
  *   <li>将工具结果拼装为 assistant(tool_calls) + tool_result 消息追加到历史</li>
  *   <li>上下文裁剪检查 → 回到步骤 2</li>
  * </ol>
  *
  * <h3>流式模式（默认启用）</h3>
- * <p>当 {@link AgentRequest#getStream()} 为 true 时，使用
- * {@link AiClient#streamText} 进行流式 LLM 调用，通过
- * {@link StreamListener} → {@link AgentEventListener#onChunk(String)} 桥接，
- * 实现前端打字机效果。</p>
+ * <p>当 {@link AgentRequest#getStream()} 为 true 时，通过
+ * {@link AiClient#generate(AiRequest, StreamListener)} 走 SSE 流式路径——
+ * 底层逐字推送 {@link AgentEventListener#onChunk(String)}，同时内部累积
+ * 文本和工具调用，最终仍返回完整的 {@link AiResponse}（含 tool_calls、usage）。</p>
  */
 @Slf4j
 public class AgentRunner {
@@ -146,27 +144,41 @@ public class AgentRunner {
             }
 
             // === 构建 AiRequest ===
-            AiRequest aiReq = buildAiRequest(messages, toolDefs, request, streaming);
+            AiRequest aiReq = buildAiRequest(messages, toolDefs, request);
 
-            // === 调用 LLM（流式 / 非流式分支） ===
-            List<ToolCall> toolCalls;
-            Usage stepUsage;
-            String stepText;
-            AiResponse aiResponse = null; // 仅非流式模式填充
-
+            // === 调用 LLM ===
+            // 流式路径：generate(req, listener) → SSE 实时推送 onChunk + 返回完整 AiResponse
+            // 非流式路径：generate(req) → 传统同步 HTTP → 返回完整 AiResponse
+            // 两条路径统一返回 AiResponse，后续处理完全一致
+            AiResponse aiResponse;
             if (streaming) {
-                // === 流式模式：StreamListener → AgentEventListener 桥接 ===
-                StreamingCallResult streamResult = executeStreamingCall(aiReq, listener);
-                toolCalls = streamResult.toolCalls();
-                stepText = streamResult.text();
-                stepUsage = streamResult.usage();
+                aiResponse = aiClient.generate(aiReq, new StreamListener() {
+                    @Override
+                    public void onChunk(String chunk) {
+                        if (listener != null) {
+                            listener.onChunk(chunk);
+                        }
+                    }
+
+                    @Override
+                    public void onComplete() {
+                        // AiResponse 由 generate() 返回后统一处理
+                    }
+
+                    @Override
+                    public void onError(Throwable e) {
+                        log.error("Agent 流式调用异常", e);
+                    }
+                });
             } else {
-                // === 非流式模式：传统 generate 调用 ===
                 aiResponse = aiClient.generate(aiReq);
-                stepUsage = aiResponse.getUsage();
-                stepText = aiResponse.getText();
-                toolCalls = aiResponse.hasToolCalls() ? aiResponse.getToolCalls() : List.of();
             }
+
+            // === 提取响应信息（两条路径统一从 AiResponse 取值） ===
+            Usage stepUsage = aiResponse.getUsage();
+            String stepText = aiResponse.getText();
+            List<ToolCall> toolCalls = aiResponse.hasToolCalls()
+                    ? aiResponse.getToolCalls() : List.of();
 
             // === 累计 Usage ===
             if (stepUsage != null) {
@@ -231,7 +243,6 @@ public class AgentRunner {
         // === 达到 maxSteps 仍未完成 ===
         if (step >= maxSteps && finalText == null && structuredOutput == null) {
             maxStepsExceeded = true;
-            // 尝试从最后一次响应中提取文本
             if (!stepResults.isEmpty()) {
                 AgentStepResult lastStep = stepResults.get(stepResults.size() - 1);
                 if (lastStep.getLlmResponse() != null) {
@@ -294,77 +305,18 @@ public class AgentRunner {
         return result;
     }
 
-    // ==================== 流式调用 ====================
-
-    /**
-     * 执行一次流式 LLM 调用，将 {@link StreamListener} 事件桥接到
-     * {@link AgentEventListener}。
-     * <p>此方法是阻塞的——{@link AiClient#streamText} 内部同步处理完整个
-     * SSE 流后才会返回。</p>
-     *
-     * @param request  AI 请求（stream=true）
-     * @param listener Agent 生命周期监听器（可为 null）
-     * @return 流式调用结果（累积文本 + 工具调用 + Token 用量）
-     */
-    private StreamingCallResult executeStreamingCall(AiRequest request, AgentEventListener listener) {
-        StringBuilder textBuilder = new StringBuilder();
-        StreamToolCallBuffer toolCallBuffer = new StreamToolCallBuffer();
-        Usage[] usageHolder = {null};
-
-        aiClient.streamText(request, new StreamListener() {
-            @Override
-            public void onChunk(String chunk) {
-                textBuilder.append(chunk);
-                // 桥接：流式文本增量 → AgentEventListener.onChunk
-                if (listener != null) {
-                    listener.onChunk(chunk);
-                }
-            }
-
-            @Override
-            public void onToolCallChunk(String callId, String name, String argumentsDelta) {
-                toolCallBuffer.accept(new StreamEvent.ToolCallChunk(callId, name, argumentsDelta));
-            }
-
-            @Override
-            public void onUsage(Usage usage) {
-                usageHolder[0] = usage;
-            }
-
-            @Override
-            public void onComplete() {
-                // flush 确保所有累积的工具调用转为完整对象
-                toolCallBuffer.flush();
-            }
-
-            @Override
-            public void onError(Throwable e) {
-                log.error("Agent 流式调用异常", e);
-            }
-        });
-
-        return new StreamingCallResult(
-                textBuilder.toString(),
-                new ArrayList<>(toolCallBuffer.getCompletedCalls()),
-                usageHolder[0]
-        );
-    }
-
-    /**
-     * 流式调用结果——内部数据传输对象。
-     */
-    private record StreamingCallResult(String text, List<ToolCall> toolCalls, Usage usage) {}
-
     // ==================== 请求构建 ====================
 
     /**
      * 构建 AiRequest，合并 AgentRequest 中的模型/温度配置。
+     * <p>注意：不设置 stream 标志——由 {@link AiClient#generate(AiRequest)}
+     * 和 {@link AiClient#generate(AiRequest, StreamListener)} 内部根据方法签名
+     * 自动确定流式/非流式路径。</p>
      */
     private AiRequest buildAiRequest(List<Message> messages, List<ToolDefinition> toolDefs,
-                                     AgentRequest request, boolean streaming) {
+                                     AgentRequest request) {
         var builder = AiRequest.builder()
-                .messages(new ArrayList<>(messages))
-                .stream(streaming);
+                .messages(new ArrayList<>(messages));
 
         if (!toolDefs.isEmpty()) {
             builder.tools(toolDefs);
@@ -387,17 +339,14 @@ public class AgentRunner {
     private List<Message> buildInitialMessages(AgentRequest request) {
         List<Message> messages = new ArrayList<>();
 
-        // System prompt
         if (request.getSystemPrompt() != null && !request.getSystemPrompt().isBlank()) {
             messages.add(Message.system(request.getSystemPrompt()));
         }
 
-        // 附加上下文消息
         if (request.getMessages() != null) {
             messages.addAll(request.getMessages());
         }
 
-        // User prompt
         if (request.getUserPrompt() != null && !request.getUserPrompt().isBlank()) {
             messages.add(Message.user(request.getUserPrompt()));
         }
@@ -434,7 +383,6 @@ public class AgentRunner {
             AgentEventListener listener) {
 
         if (toolCalls.size() == 1) {
-            // 单工具——直接在当前线程执行
             ToolCall tc = toolCalls.get(0);
             Object result = executeSingleTool(tc, registry, listener);
             Map<String, Object> results = new LinkedHashMap<>();
@@ -442,7 +390,6 @@ public class AgentRunner {
             return results;
         }
 
-        // 多工具——虚拟线程并发执行
         List<CompletableFuture<Map.Entry<String, Object>>> futures = toolCalls.stream()
                 .map(tc -> CompletableFuture.supplyAsync(() -> {
                     Object result = executeSingleTool(tc, registry, listener);
@@ -450,7 +397,6 @@ public class AgentRunner {
                 }, toolExecutor))
                 .collect(Collectors.toList());
 
-        // 等待全部完成，合并结果
         Map<String, Object> results = new LinkedHashMap<>();
         for (CompletableFuture<Map.Entry<String, Object>> future : futures) {
             try {
@@ -458,7 +404,6 @@ public class AgentRunner {
                 results.put(entry.getKey(), entry.getValue());
             } catch (Exception e) {
                 log.error("工具并行执行超时或异常", e);
-                // 对于无法获取结果的 future，填入错误信息
                 results.put("unknown-" + System.nanoTime(),
                         "工具执行失败: " + e.getMessage());
             }
@@ -477,7 +422,6 @@ public class AgentRunner {
         String toolName = toolCall.getName();
         String argsJson = toolCall.getArguments();
 
-        // 事件：onToolStart
         if (listener != null) {
             listener.onToolStart(toolName, argsJson);
         }
@@ -496,13 +440,11 @@ public class AgentRunner {
         }
 
         try {
-            // 将 arguments JSON 反序列化为工具请求参数类型
             Object requestObj;
             Class<?> requestClass = tool.requestClass();
             if (requestClass == Void.class || requestClass == void.class) {
                 requestObj = null;
             } else if (argsJson == null || argsJson.isBlank() || "{}".equals(argsJson.trim())) {
-                // 无参数工具——尝试无参构造
                 try {
                     requestObj = requestClass.getDeclaredConstructor().newInstance();
                 } catch (NoSuchMethodException e) {
@@ -514,20 +456,17 @@ public class AgentRunner {
                 requestObj = objectMapper.readValue(argsJson, requestClass);
             }
 
-            // 执行工具
             Object result = tool.execute(requestObj);
             long duration = System.currentTimeMillis() - toolStart;
             log.debug("工具 {} 执行成功 ({}ms): {}", toolName, duration,
                     result != null ? result.toString().substring(0, Math.min(100, result.toString().length())) : "null");
 
-            // 事件：onToolEnd
             if (listener != null) {
                 listener.onToolEnd(toolName, result);
             }
 
             return result != null ? result : "[工具执行完成，无返回值]";
         } catch (Exception e) {
-            // === 错误自愈：捕获异常信息回传给 LLM ===
             long duration = System.currentTimeMillis() - toolStart;
             StringWriter sw = new StringWriter();
             PrintWriter pw = new PrintWriter(sw);
@@ -538,7 +477,6 @@ public class AgentRunner {
                     toolName, duration, e.getClass().getName(), e.getMessage(), sw.toString());
             log.warn("工具 {} 执行失败 ({}ms): {}", toolName, duration, e.getMessage());
 
-            // 事件：onToolEnd（携带错误信息）
             if (listener != null) {
                 listener.onToolEnd(toolName, errorMsg);
             }

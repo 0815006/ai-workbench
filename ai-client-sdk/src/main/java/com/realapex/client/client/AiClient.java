@@ -57,6 +57,25 @@ public interface AiClient {
     AiResponse generate(AiRequest request);
 
     /**
+     * 流式生成并返回完整响应对象。
+     * <p>底层使用 SSE 流式 HTTP 请求，在逐字推送 {@code listener} 的同时，
+     * 内部累积文本、工具调用和 Token 统计，最终拼装为完整的 {@link AiResponse} 返回。</p>
+     *
+     * <h3>与 {@link #generate(AiRequest)} 的区别</h3>
+     * <ul>
+     *   <li>{@code generate(request)} — 同步 HTTP，一次性返回完整响应，无中间回调</li>
+     *   <li>{@code generate(request, listener)} — SSE 流式 HTTP，通过 {@code listener.onChunk()}
+     *       实时推送增量文本（前端打字机效果），同时返回完整 AiResponse 供 Agent 解析 tool_calls</li>
+     * </ul>
+     *
+     * @param request  统一请求对象，不能为空
+     * @param listener 流式回调监听器（onChunk/onToolCallChunk/onUsage/onComplete/onError）
+     * @return 完整 AiResponse（含累积文本、tool_calls、usage）
+     * @throws AiClientException 网络超时、API Key 失效、响应解析失败时抛出
+     */
+    AiResponse generate(AiRequest request, StreamListener listener);
+
+    /**
      * SSE 流式输出。
      * <p>适合前端实时对话、慢 SQL 分析过程展示等需要逐字输出的场景。
      * 通过 {@link StreamListener} 回调解耦，不绑定任何特定 Web 框架。</p>

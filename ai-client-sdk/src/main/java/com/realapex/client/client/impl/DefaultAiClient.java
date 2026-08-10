@@ -14,9 +14,11 @@ import com.realapex.client.executor.RetryHandler;
 import com.realapex.client.model.AiRequest;
 import com.realapex.client.model.AiResponse;
 import com.realapex.client.model.Choice;
+import com.realapex.client.model.Message;
 import com.realapex.client.model.ToolCall;
 import com.realapex.client.model.Usage;
 import com.realapex.client.skill.BaseSkill;
+import com.realapex.client.stream.StreamEvent;
 import com.realapex.client.stream.StreamToolCallBuffer;
 import lombok.extern.slf4j.Slf4j;
 
@@ -26,6 +28,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executors;
 
@@ -130,6 +133,139 @@ public class DefaultAiClient implements AiClient {
         });
     }
 
+    /**
+     * 流式生成——SSE 流式读取 + 实时回调 + 完整 AiResponse。
+     * <p>底层使用 {@link HttpResponse.BodyHandlers#ofLines()} 逐行解析 SSE 事件，
+     * 通过 {@code listener} 实时推送增量文本，同时内部累积文本、工具调用、Token 用量，
+     * 最终拼装为包含完整 tool_calls 的 {@link AiResponse} 返回。</p>
+     */
+    @Override
+    public AiResponse generate(AiRequest request, StreamListener listener) {
+        AiRequest req = ensureModel(request);
+        req.setStream(true);
+        return generateWithStreaming(req, listener);
+    }
+
+    /**
+     * SSE 流式 LLM 调用——累积文本/工具调用/Token，同时通过 listener 实时推送。
+     * <p>内部阻塞处理完整个 SSE 流后才返回拼装好的完整 AiResponse。</p>
+     */
+    private AiResponse generateWithStreaming(AiRequest req, StreamListener listener) {
+        try {
+            HttpRequest httpReq = buildHttpRequest(req);
+            HttpResponse<java.util.stream.Stream<String>> httpResp = httpClient.send(
+                    httpReq, HttpResponse.BodyHandlers.ofLines());
+
+            int status = httpResp.statusCode();
+            if (status != 200) {
+                String errorBody = httpResp.body().reduce("", (a, b) -> a + b);
+                handleHttpStreamError(status, errorBody, httpReq);
+                throw new AiClientException("流式请求失败, HTTP " + status + ": " + errorBody);
+            }
+
+            StreamToolCallBuffer toolCallBuffer = new StreamToolCallBuffer();
+            StringBuilder fullText = new StringBuilder();
+            Usage[] usage = {null};
+            String[] finishReason = {null};
+            String[] responseId = {null};
+            String[] model = {null};
+
+            httpResp.body().forEach(line -> {
+                if (line.startsWith("data: ")) {
+                    String data = line.substring(6).trim();
+                    if ("[DONE]".equals(data)) {
+                        toolCallBuffer.flush();
+                        if (listener != null) listener.onComplete();
+                        return;
+                    }
+                    try {
+                        AiResponse chunk = objectMapper.readValue(data, AiResponse.class);
+
+                        if (chunk.getId() != null) responseId[0] = chunk.getId();
+                        if (chunk.getModel() != null) model[0] = chunk.getModel();
+                        if (chunk.getUsage() != null) usage[0] = chunk.getUsage();
+
+                        if (chunk.getChoices() != null && !chunk.getChoices().isEmpty()) {
+                            Choice choice = chunk.getChoices().get(0);
+                            if (choice.getFinishReason() != null) {
+                                finishReason[0] = choice.getFinishReason();
+                            }
+
+                            Choice.Delta delta = choice.getDelta();
+                            if (delta != null) {
+                                // 文本增量 → 累积 + 回调
+                                if (delta.getContent() != null) {
+                                    fullText.append(delta.getContent());
+                                    if (listener != null) listener.onChunk(delta.getContent());
+                                }
+                                // 推理内容增量
+                                if (delta.getReasoningContent() != null) {
+                                    fullText.append(delta.getReasoningContent());
+                                    if (listener != null) listener.onChunk(delta.getReasoningContent());
+                                }
+                                // 工具调用增量 → Buffer 累积 + 回调
+                                if (delta.getToolCalls() != null) {
+                                    for (ToolCall tc : delta.getToolCalls()) {
+                                        if (tc.getId() == null && tc.getFunction() == null) continue;
+                                        if (listener != null) {
+                                            listener.onToolCallChunk(tc.getId(), tc.getName(), tc.getArguments());
+                                        }
+                                        toolCallBuffer.accept(new StreamEvent.ToolCallChunk(
+                                                tc.getId(), tc.getName(), tc.getArguments()));
+                                    }
+                                }
+                            }
+
+                            // finish_reason 触发 flush
+                            if ("tool_calls".equals(choice.getFinishReason())
+                                    || "stop".equals(choice.getFinishReason())) {
+                                toolCallBuffer.flush();
+                            }
+                        }
+                    } catch (JsonProcessingException e) {
+                        log.warn("SSE 行解析跳过: {} - 原因: {}", data, e.getMessage());
+                    }
+                }
+            });
+
+            // 流自然结束但未收到 [DONE]（兼容非标准 SSE）
+            toolCallBuffer.flush();
+
+            // === 拼装完整 AiResponse ===
+            List<ToolCall> completedToolCalls = new ArrayList<>(toolCallBuffer.getCompletedCalls());
+
+            Message respMsg = Message.builder()
+                    .role("assistant")
+                    .content(fullText.toString())
+                    .toolCalls(completedToolCalls.isEmpty() ? null : completedToolCalls)
+                    .build();
+
+            Choice respChoice = Choice.builder()
+                    .index(0)
+                    .message(respMsg)
+                    .finishReason(finishReason[0])
+                    .build();
+
+            AiResponse response = AiResponse.builder()
+                    .id(responseId[0])
+                    .model(model[0])
+                    .choices(List.of(respChoice))
+                    .usage(usage[0])
+                    .build();
+
+            log.debug("generate(streaming) 完成, text={} chars, toolCalls={}, tokens={}",
+                    fullText.length(), completedToolCalls.size(),
+                    usage[0] != null ? usage[0].getTotalTokens() : "N/A");
+
+            return response;
+        } catch (IOException e) {
+            throw new AiClientException("流式请求失败: " + e.getMessage(), e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AiClientException("流式请求被中断", e);
+        }
+    }
+
     // ==================== generateText ====================
 
     @Override
@@ -216,7 +352,7 @@ public class DefaultAiClient implements AiClient {
 
                                         // 内部 Buffer 累积
                                         toolCallBuffer.accept(
-                                                new com.realapex.client.stream.StreamEvent.ToolCallChunk(
+                                                new StreamEvent.ToolCallChunk(
                                                         callId, name, argsDelta));
                                     }
                                 }
