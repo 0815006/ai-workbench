@@ -34,6 +34,8 @@
 </dependency>
 ```
 
+#### 1.1 纯 Java 项目
+
 ```java
 AiConfig config = AiConfig.builder()
         .apiKeys(List.of("sk-xxxxxxxxx"))
@@ -46,15 +48,71 @@ String reply = client.generateText(AiRequest.builder()
         .messages(List.of(Message.user("你好")))
         .build());
 
-// SSE 流式
-client.streamText(request, new StreamListener() {
-    @Override public void onChunk(String chunk) { /* 推送给前端 */ }
-    @Override public void onComplete() { /* 结束 */ }
+// SSE 流式（打字机效果）
+AiRequest req = AiRequest.builder()
+        .messages(List.of(Message.user("介绍一下 Java 21 新特性")))
+        .build();
+client.streamText(req, new StreamListener() {
+    @Override public void onChunk(String chunk) { System.out.print(chunk); }
+    @Override public void onComplete() { System.out.println("\n[完成]"); }
+    @Override public void onError(Throwable e) { System.err.println("流式异常: " + e.getMessage()); }
 });
 
-// 结构化输出
-MyResult result = client.generateObject(request, MyResult.class);
+// 结构化 JSON 输出
+record CheckResult(List<String> errors, int score) {}
+CheckResult result = client.generateObject(
+        AiRequest.builder()
+                .messages(List.of(
+                    Message.system("你是校对员，返回 JSON：{\"errors\":[...],\"score\":0-100}"),
+                    Message.user("请检查: " + doc)))
+                .build(),
+        CheckResult.class);
 ```
+
+#### 1.2 Tool Calling（函数调用）
+
+```java
+// 定义工具 Schema
+ToolDefinition weatherTool = ToolDefinition.of(
+        "get_weather", "查询指定城市的天气",
+        Map.of("type", "object",
+               "properties", Map.of("city", Map.of("type", "string", "description", "城市名")),
+               "required", List.of("city")));
+
+// 发送请求，LLM 决定调用工具
+AiResponse response = client.generate(AiRequest.builder()
+        .messages(List.of(Message.user("北京今天天气怎么样？")))
+        .tools(List.of(weatherTool))
+        .toolChoice(ToolChoice.AUTO)
+        .build());
+
+// 判断是否有工具调用
+if (response.hasToolCalls()) {
+    for (ToolCall tc : response.getToolCalls()) {
+        System.out.println("LLM 请求调用: " + tc.getName() + "(" + tc.getArguments() + ")");
+        // 执行业务逻辑，构造 tool 消息回传
+        String toolResult = callWeatherApi(tc.getArguments());
+        // 下一轮请求携带 tool 消息...
+    }
+}
+```
+
+#### 1.3 错误处理
+
+```java
+try {
+    String reply = client.generateText(request);
+} catch (RateLimitException e) {
+    // SDK 已自动重试 3 次仍失败，需业务侧等待后重试
+    Thread.sleep(5000);
+} catch (AuthenticationException e) {
+    // API Key 无效，检查配置
+} catch (AiClientException e) {
+    // 其他通信异常
+}
+```
+
+---
 
 ### 2. ai-tool-sdk — 定义工具
 
@@ -66,7 +124,7 @@ MyResult result = client.generateObject(request, MyResult.class);
 </dependency>
 ```
 
-**方式一：实现 AgentTool 接口**
+#### 2.1 实现 AgentTool 接口（推荐，纯 Java 可用）
 
 ```java
 public class CalculatorTool implements AgentTool<CalculatorTool.Input, Double> {
@@ -83,9 +141,17 @@ public class CalculatorTool implements AgentTool<CalculatorTool.Input, Double> {
         @ToolParam(description = "数学表达式", required = true) String expression
     ) {}
 }
+
+// 使用安全执行包装
+ToolResult result = new CalculatorTool().executeSafely(new CalculatorTool.Input("1+1"));
+if (result.isSuccess()) {
+    System.out.println("结果: " + result.getData());
+} else {
+    System.out.println("失败: " + result.getError());
+}
 ```
 
-**方式二：@Tool 注解（Spring 环境自动扫描）**
+#### 2.2 @Tool 注解（Spring 环境，自动扫描）
 
 ```java
 @Component
@@ -95,7 +161,39 @@ public class MyTools {
         return weatherService.query(city);
     }
 }
+// 无需手动注册，ToolBeanPostProcessor 自动发现并注册到 ToolRegistry
 ```
+
+#### 2.3 生成 JSON Schema（独立使用）
+
+```java
+SchemaGenerator generator = new SchemaGenerator();
+Map<String, Object> schema = generator.generate(CalculatorTool.Input.class);
+// → {"type":"object","properties":{"expression":{"type":"string","description":"数学表达式"}},"required":["expression"]}
+```
+
+#### 2.4 安全拦截器
+
+```java
+// 三个内置拦截器，按优先级链式执行：
+// ParamValidator (优先级10) → DangerousCommandFilter (优先级20) → TimeoutInterceptor (优先级50)
+
+// 危险命令过滤示例——以下输入会被拦截：
+// "DROP TABLE users"     → SQL 注入拦截
+// "rm -rf /"             → 系统命令拦截
+// "../../etc/passwd"     → 路径遍历拦截
+// "Runtime.getRuntime()" → 代码注入拦截
+
+// 自定义拦截器
+public class MyAuditInterceptor implements ToolSecurityInterceptor {
+    @Override public void before(String toolName, Object request) {
+        log.info("工具调用审计: {} -> {}", toolName, request);
+    }
+    @Override public int priority() { return 5; }  // 最先执行
+}
+```
+
+---
 
 ### 3. ai-agent-sdk — 智能体编排
 
@@ -107,8 +205,10 @@ public class MyTools {
 </dependency>
 ```
 
+#### 3.1 基础用法
+
 ```java
-// 创建 AgentRunner（单例，线程安全）
+// 创建引擎（单例，线程安全）
 AgentRunner agentRunner = new AgentRunner(aiClient, new SchemaGenerator());
 
 // 注册工具
@@ -116,19 +216,66 @@ ToolRegistry registry = new ToolRegistry(new SchemaGenerator());
 registry.register(new CalculatorTool());
 
 // 运行 Agent
-AgentResult result = agentRunner.run(AgentRequest.builder()
-        .systemPrompt("你是一个数学助手，遇到计算时使用 calculator 工具")
-        .userPrompt("计算 (123 + 456) × 789 的结果")
-        .tools(registry.getAll())
-        .maxSteps(5)
-        .build());
+try {
+    AgentResult result = agentRunner.run(AgentRequest.builder()
+            .systemPrompt("你是一个数学助手，遇到计算时使用 calculator 工具")
+            .userPrompt("计算 (123 + 456) × 789")
+            .tools(registry.getAll())
+            .maxSteps(5)
+            .build());
 
-System.out.println(result.getFinalText());
-System.out.println("Token 消耗: " + result.getTotalTokens());
-System.out.println("执行步数: " + result.getTotalSteps());
+    System.out.println("最终回答: " + result.getFinalText());
+    System.out.println("执行步数: " + result.getTotalSteps());
+    System.out.println("Token 消耗: " + result.getTotalTokens());
+} catch (AgentMaxStepsExceededException e) {
+    // 达到 maxSteps 仍未完成，e.getPartialResult() 可获取已有结果
+    System.err.println("Agent 在 " + e.getMaxSteps() + " 步内未完成任务");
+}
 ```
 
-### 4. Spring Boot 自动装配
+#### 3.2 结构化输出
+
+```java
+record SlowSqlAnalysis(String rootCause, List<String> suggestions, int severity) {}
+
+AgentResult result = agentRunner.run(
+        AgentRequest.builder()
+                .systemPrompt("你是 MySQL 专家，分析慢 SQL 并给出优化建议")
+                .userPrompt("分析: " + slowSql)
+                .tools(List.of(explainTool, indexAdvisorTool))
+                .maxSteps(5)
+                .build(),
+        SlowSqlAnalysis.class);  // ← 指定输出类型
+
+SlowSqlAnalysis analysis = (SlowSqlAnalysis) result.getStructuredOutput();
+System.out.println("根因: " + analysis.rootCause());
+System.out.println("严重度: " + analysis.severity());
+```
+
+#### 3.3 生命周期监听
+
+```java
+AgentResult result = agentRunner.run(AgentRequest.builder()
+        .userPrompt("...")
+        .tools(tools)
+        .listener(new AgentEventListener() {
+            @Override public void onStepStart(int step) {
+                System.out.println("--- 第 " + step + " 步开始 ---");
+            }
+            @Override public void onToolStart(String name, String args) {
+                System.out.println("调用工具: " + name + "(" + args + ")");
+            }
+            @Override public void onToolEnd(String name, Object result) {
+                System.out.println("工具返回: " + result);
+            }
+            @Override public void onStepFinish(AgentStepResult stepResult) {
+                System.out.println("步耗时: " + stepResult.getDurationMs() + "ms");
+            }
+        })
+        .build());
+```
+
+#### 3.4 Spring Boot 自动装配
 
 `application.yml`：
 
@@ -149,7 +296,6 @@ ai:
 ```java
 @RestController
 public class AgentController {
-    @Autowired private AiClient aiClient;
     @Autowired private AgentRunner agentRunner;
     @Autowired private ToolRegistry toolRegistry;
 
@@ -165,6 +311,32 @@ public class AgentController {
 
 ---
 
+## ReAct 循环流程
+
+```
+用户输入 "北京天气如何？"
+  │
+  ▼
+┌─ Step 1 ───────────────────────────────────────┐
+│ LLM 思考 → 决定调用 get_weather(city="北京")     │
+│ 并行执行工具 → API 返回 "晴，25°C"                │
+│ 工具结果回传 messages                            │
+│ ContextTrimmer 检查 Token → 无需裁剪              │
+└────────────────────────────────────────────────┘
+  │
+  ▼
+┌─ Step 2 ───────────────────────────────────────┐
+│ LLM 收到工具结果 → 组织自然语言                   │
+│ finish_reason=stop → 无更多 tool_calls           │
+│ 返回最终文本："北京今天晴天，气温 25°C"            │
+└────────────────────────────────────────────────┘
+  │
+  ▼
+AgentResult { finalText, totalSteps=2, totalUsage, stepResults }
+```
+
+---
+
 ## 配置参考
 
 ### ai-client-sdk (`ai.sdk.*`)
@@ -172,18 +344,20 @@ public class AgentController {
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `base-url` | `https://api.deepseek.com/v1` | 兼容 OpenAI 的 API 端点 |
-| `api-keys` | —（必填） | API Key 列表，Round-Robin 轮询 |
+| `api-keys` | —（必填） | API Key 列表，Round-Robin 轮询，401/402 自动隔离 10 分钟 |
 | `model` | `deepseek-chat` | 默认模型 |
-| `timeout` | `60s` | 请求超时 |
+| `timeout` | `60s` | 总请求超时 |
+| `connect-timeout` | `10s` | TCP 连接超时 |
 | `read-timeout` | `30s` | SSE 流式无数据包最大等待间隔 |
-| `max-retries` | `3` | 429/5xx 重试次数 |
+| `max-retries` | `3` | 429/5xx 自动重试次数 |
+| `retry-base-delay` | `1s` | 重试指数退避基础延迟 |
 | `key-blacklist-duration` | `10m` | Key 故障隔离时长（401/402） |
 
 ### ai-agent-sdk (`ai.agent.*`)
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `max-steps` | `10` | ReAct 循环最大步数 |
+| `max-steps` | `10` | ReAct 循环最大步数，超步抛出 AgentMaxStepsExceededException |
 | `max-context-tokens` | `8000` | 触发上下文裁剪的 Token 阈值 |
 | `model` | — | 覆盖 ai-client-sdk 的默认模型 |
 
@@ -198,6 +372,14 @@ ai-workbench/
  ├── ai-client-sdk/         <-- 通信基座
  ├── ai-tool-sdk/           <-- 工具基座
  └── ai-agent-sdk/          <-- 编排引擎
+```
+
+## 构建
+
+```bash
+git clone ...
+cd ai-workbench
+mvn clean install -DskipTests    # 一次性构建全部模块
 ```
 
 > API 详细文档见各模块源码 **Javadoc**。发布 Jar 附带 `-sources.jar`，IDE 自动读取 Javadoc 提供参数提示与异常处理建议。
