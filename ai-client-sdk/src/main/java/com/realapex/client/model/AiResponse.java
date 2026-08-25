@@ -44,6 +44,9 @@ public class AiResponse {
     @JsonProperty("usage")
     private Usage usage;
 
+    /** 推理/思考链内容（DeepSeek-R1、o1 等推理模型专用，由 ModelProvider 提取填充） */
+    private String reasoningContent;
+
     /**
      * 提取第一条回复的文本内容。
      *

@@ -14,6 +14,10 @@ import java.util.List;
 @Builder
 public class AiConfig {
 
+    /** 模型提供商策略名称：openai / deepseek / ollama（默认 openai 标准协议） */
+    @Builder.Default
+    private String provider = "openai";
+
     /** API 端点 Base URL（兼容 OpenAI 格式） */
     @Builder.Default
     private String baseUrl = "https://api.deepseek.com/v1";

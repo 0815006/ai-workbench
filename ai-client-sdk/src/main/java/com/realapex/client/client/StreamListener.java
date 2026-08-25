@@ -19,6 +19,18 @@ public interface StreamListener {
     void onChunk(String chunk);
 
     /**
+     * 接收到推理/思考链增量片段（DeepSeek-R1、o1 等推理模型专用）。
+     * <p>与 {@link #onChunk} 的区别：本回调推送的是模型的思考过程
+     * （reasoning_content），而非最终回答文本。前端可将其展示为
+     * "思考中" 折叠面板。</p>
+     *
+     * @param reasoningChunk 推理内容增量
+     */
+    default void onReasoningChunk(String reasoningChunk) {
+        // 默认空实现，保持向后兼容
+    }
+
+    /**
      * 接收到工具调用增量片段。
      * <p>当大模型在流式输出中发起 Function Calling 时触发。
      * 单次工具调用的 arguments 可能分多帧到达，业务方可使用 {@code StreamToolCallBuffer} 累积拼接。</p>

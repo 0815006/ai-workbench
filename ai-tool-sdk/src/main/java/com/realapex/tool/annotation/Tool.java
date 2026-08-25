@@ -51,4 +51,21 @@ public @interface Tool {
      * @return true 表示只读
      */
     boolean readOnly() default false;
+
+    /**
+     * 是否需要人工审批（HITL, Human-in-the-Loop）。
+     * <p>标记为 true 的高危工具（如写库、执行 Shell、敏感 API 调用）在 LLM 拟调用时，
+     * AgentRunner 会中断 ReAct 循环并抛出 {@code AgentSuspendedException}，
+     * 等待人工审批通过后才继续执行。</p>
+     *
+     * <h3>典型场景</h3>
+     * <ul>
+     *   <li>写数据库（INSERT/UPDATE/DELETE）</li>
+     *   <li>执行高危 Shell 命令（部署、重启服务）</li>
+     *   <li>调用敏感外部 API（支付、发送消息）</li>
+     * </ul>
+     *
+     * @return true 表示需要人工审批
+     */
+    boolean requiresApproval() default false;
 }

@@ -31,6 +31,10 @@ public class Message {
     @JsonProperty("content")
     private String content;
 
+    /** 推理/思考链内容（DeepSeek-R1、o1 等推理模型专用，非流式响应） */
+    @JsonProperty("reasoning_content")
+    private String reasoningContent;
+
     /** 工具调用列表（role=assistant 且发起 function call 时使用） */
     @JsonProperty("tool_calls")
     private List<ToolCall> toolCalls;

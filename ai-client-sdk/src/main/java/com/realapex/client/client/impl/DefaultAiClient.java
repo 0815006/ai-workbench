@@ -17,6 +17,8 @@ import com.realapex.client.model.Choice;
 import com.realapex.client.model.Message;
 import com.realapex.client.model.ToolCall;
 import com.realapex.client.model.Usage;
+import com.realapex.client.provider.ModelProvider;
+import com.realapex.client.provider.ModelProviderFactory;
 import com.realapex.client.skill.BaseSkill;
 import com.realapex.client.stream.StreamEvent;
 import com.realapex.client.stream.StreamToolCallBuffer;
@@ -52,6 +54,7 @@ public class DefaultAiClient implements AiClient {
     private final KeySelector keySelector;
     private final RetryHandler retryHandler;
     private final JsonRepairParser jsonRepairParser;
+    private final ModelProvider modelProvider;
 
     /**
      * 私有构造器，通过 {@link #create(AiConfig)} 工厂方法创建。
@@ -70,6 +73,7 @@ public class DefaultAiClient implements AiClient {
                 config.getMaxRetries(),
                 config.getRetryBaseDelay());
         this.jsonRepairParser = new JsonRepairParser(objectMapper);
+        this.modelProvider = ModelProviderFactory.create(config.getProvider());
     }
 
     /**
@@ -111,18 +115,28 @@ public class DefaultAiClient implements AiClient {
     public AiResponse generate(AiRequest request) {
         AiRequest req = ensureModel(request);
         req.setStream(false);
+        // 厂商协议适配（Ollama 等本地模型注入 Tool Prompt）
+        AiRequest adaptedReq = modelProvider.adaptRequest(req);
 
         return retryHandler.executeWithRetry(() -> {
             try {
-                HttpRequest httpReq = buildHttpRequest(req);
+                HttpRequest httpReq = buildHttpRequest(adaptedReq);
                 HttpResponse<String> httpResp = httpClient.send(
                         httpReq, HttpResponse.BodyHandlers.ofString());
                 handleHttpError(httpResp);
                 AiResponse aiResp = objectMapper.readValue(
                         httpResp.body(), AiResponse.class);
-                log.debug("generate 完成, hasToolCalls={}, tokens={}",
+                // 厂商响应降级解析（非标准 JSON 时回退）
+                AiResponse providerResp = modelProvider.parseResponse(httpResp.body());
+                if (providerResp != null) {
+                    aiResp = providerResp;
+                }
+                // 提取推理/思考链内容
+                aiResp.setReasoningContent(modelProvider.extractReasoning(aiResp));
+                log.debug("generate 完成, hasToolCalls={}, tokens={}, reasoning={}",
                         aiResp.hasToolCalls(),
-                        aiResp.getUsage() != null ? aiResp.getUsage().getTotalTokens() : "N/A");
+                        aiResp.getUsage() != null ? aiResp.getUsage().getTotalTokens() : "N/A",
+                        aiResp.getReasoningContent() != null ? "yes" : "no");
                 return aiResp;
             } catch (IOException e) {
                 throw new AiClientException("网络请求失败: " + e.getMessage(), e);
@@ -143,6 +157,8 @@ public class DefaultAiClient implements AiClient {
     public AiResponse generate(AiRequest request, StreamListener listener) {
         AiRequest req = ensureModel(request);
         req.setStream(true);
+        // 厂商协议适配（Ollama 等本地模型注入 Tool Prompt）
+        req = modelProvider.adaptRequest(req);
         return generateWithStreaming(req, listener);
     }
 
@@ -198,10 +214,10 @@ public class DefaultAiClient implements AiClient {
                                     fullText.append(delta.getContent());
                                     if (listener != null) listener.onChunk(delta.getContent());
                                 }
-                                // 推理内容增量
+                                // 推理内容增量（DeepSeek-R1 / o1 思考链）
                                 if (delta.getReasoningContent() != null) {
                                     fullText.append(delta.getReasoningContent());
-                                    if (listener != null) listener.onChunk(delta.getReasoningContent());
+                                    if (listener != null) listener.onReasoningChunk(delta.getReasoningContent());
                                 }
                                 // 工具调用增量 → Buffer 累积 + 回调
                                 if (delta.getToolCalls() != null) {
@@ -252,6 +268,8 @@ public class DefaultAiClient implements AiClient {
                     .choices(List.of(respChoice))
                     .usage(usage[0])
                     .build();
+            // 提取推理/思考链内容（DeepSeek-R1 等）
+            response.setReasoningContent(modelProvider.extractReasoning(response));
 
             log.debug("generate(streaming) 完成, text={} chars, toolCalls={}, tokens={}",
                     fullText.length(), completedToolCalls.size(),
@@ -330,10 +348,10 @@ public class DefaultAiClient implements AiClient {
                                     chunkCount[0]++;
                                     listener.onChunk(delta.getContent());
                                 }
-                                // 推理内容增量
+                                // 推理内容增量（DeepSeek-R1 / o1 思考链）
                                 if (delta.getReasoningContent() != null) {
                                     chunkCount[0]++;
-                                    listener.onChunk(delta.getReasoningContent());
+                                    listener.onReasoningChunk(delta.getReasoningContent());
                                 }
                                 // 工具调用增量
                                 if (delta.getToolCalls() != null) {

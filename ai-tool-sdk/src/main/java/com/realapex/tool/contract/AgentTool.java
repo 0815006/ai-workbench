@@ -64,6 +64,19 @@ public interface AgentTool<REQ, RESP> {
     RESP execute(REQ request) throws Exception;
 
     /**
+     * 该工具是否需要人工审批（HITL）。
+     * <p>返回 true 时，AgentRunner 在 LLM 拟调用此工具前中断 ReAct 循环，
+     * 抛出 {@code AgentSuspendedException} 等待人工审批，审批通过后恢复执行。</p>
+     * <p>默认返回 false（无需审批）。实现类可覆盖，或通过
+     * {@code @Tool(requiresApproval = true)} 注解声明。</p>
+     *
+     * @return true 表示需要人工审批
+     */
+    default boolean requiresApproval() {
+        return false;
+    }
+
+    /**
      * 安全执行工具，将异常包装为 {@link ToolResult}。
      * <p>默认实现调用 {@link #execute} 并包装结果。子类可覆盖以自定义错误处理。</p>
      *

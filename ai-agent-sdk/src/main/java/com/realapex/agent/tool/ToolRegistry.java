@@ -59,6 +59,21 @@ public class ToolRegistry {
      */
     @SuppressWarnings({ "unchecked", "rawtypes" })
     public void registerMethodTool(String name, String description, Method method, Object bean) {
+        registerMethodTool(name, description, method, bean, false);
+    }
+
+    /**
+     * 注册一个由 @Tool 注解方法包装的工具（支持 HITL 审批标记）。
+     *
+     * @param name              工具名称
+     * @param description       工具描述
+     * @param method            目标方法
+     * @param bean              方法所属 Bean 实例
+     * @param requiresApproval  是否需要人工审批（HITL）
+     */
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public void registerMethodTool(String name, String description, Method method, Object bean,
+                                   boolean requiresApproval) {
         if (tools.containsKey(name)) {
             throw new IllegalArgumentException("Tool 名称冲突: " + name + " 已注册");
         }
@@ -77,6 +92,9 @@ public class ToolRegistry {
             }
 
             @Override
+            public boolean requiresApproval() { return requiresApproval; }
+
+            @Override
             public Object execute(Object request) throws Exception {
                 if (paramTypes.length == 0) {
                     return method.invoke(bean);
@@ -85,7 +103,8 @@ public class ToolRegistry {
             }
         };
         tools.put(name, adapter);
-        log.debug("注册 @Tool 方法: {} -> {}.{}", name, bean.getClass().getSimpleName(), method.getName());
+        log.debug("注册 @Tool 方法: {} -> {}.{} (requiresApproval={})",
+                name, bean.getClass().getSimpleName(), method.getName(), requiresApproval);
     }
 
     /**

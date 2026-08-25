@@ -71,10 +71,12 @@ public class ToolBeanPostProcessor implements BeanPostProcessor {
                 description = "执行 " + toolName;
             }
 
+            boolean requiresApproval = toolAnnotation.requiresApproval();
+
             try {
-                toolRegistry.registerMethodTool(toolName, description, method, bean);
-                log.info("自动注册 @Tool: {} -> {}.{}",
-                        toolName, clazz.getSimpleName(), method.getName());
+                toolRegistry.registerMethodTool(toolName, description, method, bean, requiresApproval);
+                log.info("自动注册 @Tool: {} -> {}.{} (requiresApproval={})",
+                        toolName, clazz.getSimpleName(), method.getName(), requiresApproval);
             } catch (IllegalArgumentException e) {
                 log.error("@Tool 注册失败 [{}.{}]: {}", clazz.getSimpleName(), method.getName(), e.getMessage());
                 throw e;

@@ -18,13 +18,24 @@ import com.realapex.client.model.Usage;
  * }</pre>
  */
 public sealed interface StreamEvent
-        permits StreamEvent.TextChunk, StreamEvent.ToolCallChunk,
+        permits StreamEvent.TextChunk, StreamEvent.ReasoningChunk, StreamEvent.ToolCallChunk,
                 StreamEvent.UsageEvent, StreamEvent.Complete {
 
     /**
      * 文本增量事件。
      */
     record TextChunk(String content) implements StreamEvent {
+    }
+
+    /**
+     * 推理/思考链增量事件（DeepSeek-R1、o1 等推理模型专用）。
+     * <p>与 {@link TextChunk} 的区别：本事件推送的是模型的思考过程
+     * （reasoning_content），而非最终回答文本。前端可将其展示为
+     * "思考中" 折叠面板。</p>
+     *
+     * @param content 推理内容增量
+     */
+    record ReasoningChunk(String content) implements StreamEvent {
     }
 
     /**
