@@ -1,6 +1,7 @@
 package com.realapex.agent.execution;
 
 import com.realapex.agent.event.AgentEventListener;
+import com.realapex.agent.event.AgentStreamListener;
 import com.realapex.tool.contract.AgentTool;
 import lombok.Builder;
 import lombok.Data;
@@ -47,6 +48,9 @@ public class AgentRequest {
 
     /** 生命周期事件监听器 */
     private AgentEventListener listener;
+
+    /** 流式事件监听器（SSE 中间步骤实时推送：思考增量/工具触发/工具结果/最终结果） */
+    private AgentStreamListener streamListener;
 
     /** 模型名称（留空使用 AiClient 默认模型） */
     private String model;
