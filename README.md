@@ -17,6 +17,9 @@
 - **框架无关** — 纯 Java 可用，Spring Boot 自动装配可选
 - **高可用内置** — API Key 轮询、故障隔离、指数退避重试、JSON 容错开箱即用
 - **安全沙箱** — 工具执行链式拦截：参数校验 → 危险命令过滤 → 超时控制
+- **流式 Agent** — `AgentStreamEvent` 密封事件体系，实时推送思考增量与工具执行中间步骤
+- **HITL 人工确认** — `@Tool(requiresApproval=true)` 高危工具挂起等待审批，`resume()` 恢复执行
+- **多厂商适配** — `ModelProvider` 策略接口：OpenAI / DeepSeek（思考链）/ Ollama 本地模型
 
 ---
 
@@ -275,7 +278,51 @@ AgentResult result = agentRunner.run(AgentRequest.builder()
         .build());
 ```
 
-#### 3.4 Spring Boot 自动装配
+#### 3.4 流式 Agent（实时推送思考与工具执行中间步骤）
+
+```java
+AgentResult result = agentRunner.run(AgentRequest.builder()
+        .userPrompt("分析项目代码结构并给出优化建议")
+        .tools(tools)
+        .streamListener(new AgentStreamListener() {
+            @Override public void onThoughtChunk(String chunk) {
+                System.out.print(chunk);            // 思考增量（打字机效果）
+            }
+            @Override public void onToolCallStart(String callId, String name, String arguments) {
+                System.out.println("\n[工具] " + name + "(" + arguments + ")");
+            }
+            @Override public void onToolCallResult(String callId, String name, Object result) {
+                System.out.println("[结果] " + result);
+            }
+            @Override public void onFinalResult(String text, Object structuredOutput) {
+                System.out.println("\n[完成] " + text);
+            }
+        })
+        .build());
+```
+
+#### 3.5 HITL 人工确认（高危工具挂起/恢复）
+
+```java
+// 1. 标记高危工具：@Tool(name = "exec_command", requiresApproval = true)
+
+// 2. 运行 Agent —— 遇到高危工具时抛出 AgentSuspendedException
+try {
+    agentRunner.run(AgentRequest.builder()
+            .userPrompt("执行 mvn clean install 并汇报结果")
+            .tools(tools)
+            .build());
+} catch (AgentSuspendedException e) {
+    String suspendId = e.getSuspendId();            // 挂起 ID，用于恢复
+    AgentState state = e.getAgentState();           // 挂起快照（messages、pendingToolCalls）
+
+    // 3. 人工审批后恢复执行
+    agentRunner.resume(suspendId, ApprovalResult.approve("ops-admin", "确认安全，允许执行"));
+    // 或拒绝：agentRunner.resume(suspendId, ApprovalResult.reject("ops-admin", "命令不在白名单"));
+}
+```
+
+#### 3.6 Spring Boot 自动装配
 
 `application.yml`：
 
@@ -346,6 +393,7 @@ AgentResult { finalText, totalSteps=2, totalUsage, stepResults }
 | `base-url` | `https://api.deepseek.com/v1` | 兼容 OpenAI 的 API 端点 |
 | `api-keys` | —（必填） | API Key 列表，Round-Robin 轮询，401/402 自动隔离 10 分钟 |
 | `model` | `deepseek-chat` | 默认模型 |
+| `provider` | `openai` | 厂商策略：`openai` / `deepseek` / `ollama`（或 `vllm` / `local`） |
 | `timeout` | `60s` | 总请求超时 |
 | `connect-timeout` | `10s` | TCP 连接超时 |
 | `read-timeout` | `30s` | SSE 流式无数据包最大等待间隔 |
@@ -367,7 +415,8 @@ AgentResult { finalText, totalSteps=2, totalUsage, stepResults }
 
 ```
 ai-workbench/
- ├── README.md              <-- 唯一文档（本文件）
+ ├── README.md              <-- 快速上手（本文件）
+ ├── 能力清单.md            <-- 全量能力清单与迭代路线
  ├── pom.xml                <-- 父 POM
  ├── ai-client-sdk/         <-- 通信基座
  ├── ai-tool-sdk/           <-- 工具基座
