@@ -105,6 +105,7 @@ public class ExcelConverter implements DocumentConverter {
 
                     SheetCollector collector = new SheetCollector(options);
                     SAXParserFactory factory = SAXParserFactory.newInstance();
+                    factory.setNamespaceAware(true);
                     SAXParser saxParser = factory.newSAXParser();
                     XMLReader parser = saxParser.getXMLReader();
                     XSSFSheetXMLHandler handler =

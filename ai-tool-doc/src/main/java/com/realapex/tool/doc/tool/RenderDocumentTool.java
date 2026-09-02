@@ -97,6 +97,9 @@ public class RenderDocumentTool implements AgentTool<RenderRequest, RenderResult
 
         // 3. 确定输出路径（防覆盖 + 时间戳去冲突）
         Path output = resolveOutputPath(request, template);
+        if (output.getParent() != null) {
+            Files.createDirectories(output.getParent());
+        }
 
         // 4. 按模板格式路由渲染
         DocFormat format = DocFormat.fromExtension(template.getFileName().toString());
