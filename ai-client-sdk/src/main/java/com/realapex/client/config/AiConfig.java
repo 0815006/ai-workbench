@@ -1,5 +1,6 @@
 package com.realapex.client.config;
 
+import com.realapex.client.trace.LLMInvokeTraceInterceptor;
 import lombok.Builder;
 import lombok.Data;
 
@@ -52,4 +53,7 @@ public class AiConfig {
     /** Key 黑名单隔离时长（401/402 后临时禁用） */
     @Builder.Default
     private Duration keyBlacklistDuration = Duration.ofMinutes(10);
+
+    /** Trace 拦截器（可选）。配置后每次 LLM 调用的请求/响应将自动落盘到 sys_llm_invoke_log */
+    private LLMInvokeTraceInterceptor traceInterceptor;
 }

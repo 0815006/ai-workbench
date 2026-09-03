@@ -117,6 +117,74 @@ try {
 }
 ```
 
+#### 1.4 上下文持久化（Trace 自动落盘）
+
+`ai-client-sdk` 内置通用调用日志与 Trace 持久化能力，将每次 LLM 调用的 **请求/响应全量上下文**、Token 统计、状态机（`INIT→RUNNING→STREAMING→SUCCESS/FAILED`）与 **TTFT 首 Token 延迟** 自动写入应用侧 PostgreSQL 的 `sys_llm_invoke_log` 表，开发者零手动建表成本。
+
+##### Spring Boot 接入（两处配置 + 声明业务上下文）
+
+```yaml
+ai:
+  client:
+    trace:
+      enabled: true             # 开启通用日志记录
+      auto-ddl: true            # 启动时若无 sys_llm_invoke_log 表则自动建表
+      max-payload-length: 50000 # 单条日志 request/response JSON 最大字符（超长截断）
+```
+
+应用侧 Flyway 可在 `locations` 追加 SDK 固化的脚本目录，由应用统一调度 DDL（推荐）：
+```yaml
+spring:
+  flyway:
+    locations:
+      - classpath:db/migration      # 应用侧原有脚本
+      - classpath:db/sdk-migration  # SDK 固化脚本（V1.0.0_1__create_sys_llm_invoke_log.sql）
+```
+
+业务代码入口声明上下文，剩余全部自动完成：
+```java
+@PostMapping("/analyze")
+public SseEmitter analyzeDatabase(@RequestBody DBAnalysisRequest request) {
+    // 1. 设置 Trace 上下文（场景类型、会话 ID）
+    LLMTraceContext.set(TraceContext.builder()
+            .sceneType("DB_ANALYSIS")
+            .sessionId(request.getSessionId())
+            .build());
+
+    try {
+        // 2. 直接调用 Agent（拦截器自动落盘请求/响应/Tokens/TTFT）
+        return dbAgentService.runStreamAnalysis(request);
+    } finally {
+        // 3. 清理上下文（防线程池泄漏）
+        LLMTraceContext.clear();
+    }
+}
+```
+
+##### 纯 Java 接入（手动装配，框架无关）
+
+```java
+// 复用应用侧已配置的 DataSource（推荐复用连接池，不新建数据库）
+AsyncLLMLogStorageService storage = new AsyncLLMLogStorageService(dataSource, "sys_llm_invoke_log", 2);
+LLMInvokeTraceInterceptor interceptor = new LLMInvokeTraceInterceptor(storage, props);
+
+AiClient client = DefaultAiClient.create(AiConfig.builder()
+        .apiKeys(List.of("sk-xxx"))
+        .traceInterceptor(interceptor)   // 注入后每次调用自动落盘
+        .build());
+
+// 异步场景跨线程透传上下文
+TraceContext ctx = LLMTraceContext.get();
+CompletableFuture<AiResponse> future = CompletableFuture.supplyAsync(() ->
+        LLMTraceContext.wrap(ctx, () -> client.generate(request)));
+```
+
+##### 表结构要点
+
+- 全量上下文存于 `request_payload` / `response_payload` 两个 **JSONB** 字段（System Prompt、多轮 Messages、Tools、推理链、ToolCall 结果）。
+- 异步状态机、`trace_id` / `parent_log_id` 用于 Agent 子任务树状串联。
+- 内置 `created_at` 索引，便于应用侧定期清理/冷热分离大 JSONB。
+
 ---
 
 ### 2. ai-tool-sdk — 定义工具
@@ -360,6 +428,181 @@ public class AgentController {
 
 ---
 
+### 4. ai-tool-doc — 文档转换/模板渲染
+
+```xml
+<dependency>
+    <groupId>com.realapex</groupId>
+    <artifactId>ai-tool-doc</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+#### 4.1 工具清单
+
+| 工具名 | 说明 |
+|---|---|
+| `read_and_convert_doc` | 文档 → Markdown（Word/Excel/PDF，支持本地路径 / http(s) URL / Base64） |
+| `inspect_template_schema` | 模板占位符探查（.docx/.xlsx），输出字段清单供 Agent 准备渲染数据 |
+| `render_document` | 数据 → 模板渲染（poi-tl 渲染 Word、EasyExcel 渲染 Excel） |
+
+#### 4.2 纯 Java 用法
+
+```java
+// 1. 构建配置（沙箱根目录 + 输出目录）
+DocToolConfig config = DocToolConfig.builder()
+        .baseDir(Path.of("/home/workspace/docs"))
+        .outputDir(Path.of("/home/workspace/docs/output"))
+        .build();
+
+// 2. 一键挂载 3 个文档原子工具
+List<AgentTool<?, ?>> docTools = DocToolFactory.createDocTools(config);
+
+// 3. 领域专属路径拦截器（优先级 5，先于通用链执行）
+ToolSecurityInterceptor interceptor = DocToolFactory.createPathInterceptor(config);
+
+// 4. 直接调用：Word → Markdown
+ToolResult result = docTools.get(0).executeSafely(
+        new DocConvertRequest("/home/workspace/docs/report.docx", null, null, null));
+if (result.isSuccess()) {
+    DocConvertResult data = (DocConvertResult) result.getData();
+    System.out.println(data.getMarkdown());
+}
+```
+
+#### 4.3 Spring Boot 自动装配
+
+`application.yml`：
+
+```yaml
+realapex:
+  tool:
+    doc:
+      base-dir: /home/workspace/docs
+      output-dir: /home/workspace/docs/output
+      max-doc-size-bytes: 20971520
+      max-output-chars: 20000
+      max-pages: 50
+      max-rows: 100
+      max-cols: 50
+      extract-images: true
+      auto-upgrade-doc: true
+      render-requires-approval: false
+      timeout-ms: 30000
+```
+
+自动注册 Bean：`docToolConfig`（配置）、`docTools`（3 个工具）、`documentPathInterceptor`（路径拦截器）。
+
+#### 4.4 安全特性
+
+- **路径沙箱**：`DocumentPathInterceptor`（优先级 5）校验输入/输出路径，禁止 `../` 穿越与沙箱外逃逸
+- **大小卡口**：文档 ≤ 20MB、PDF/Word ≤ 50 页、Excel ≤ 100 行 × 50 列（防 OOM）
+- **输出截断**：单工具返回 ≤ 20,000 字符（复用 `OutputTruncator`）
+- **HITL 可选**：`render-requires-approval: true` 时渲染操作触发人工审批
+
+---
+
+### 5. ai-tool-db — 数据库工具
+
+```xml
+<dependency>
+    <groupId>com.realapex</groupId>
+    <artifactId>ai-tool-db</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+#### 5.1 工具清单
+
+| 工具名 | 说明 |
+|---|---|
+| `get_db_schema` | Schema 探查（表/字段/索引/主外键/注释，带缓存） |
+| `readonly_query` | 只读查询（SELECT/SHOW/DESCRIBE/EXPLAIN，语法级只读校验） |
+| `explain_sql` | 执行计划诊断（EXPLAIN，输出计划行） |
+| `fetch_slow_logs` | 慢查询抓取（MySQL `mysql.slow_log` / GaussDB `dbe_perf.statement_history`） |
+| `execute_update` | 受控写操作（仅 INSERT/UPDATE/DELETE，触发 HITL 人工审批） |
+
+#### 5.2 双模式接入
+
+```java
+// 模式 A：外部注入 DataSource（推荐，生命周期归应用管理）
+List<AgentTool<?, ?>> dbTools = DbToolFactory.createDbTools(
+        DbToolConfig.builder().dataSource(ds).build());
+
+// 模式 B：工具包托管连接池（TTL 空闲自动销毁）
+DbConnectionManager manager = new DbConnectionManager(null);
+manager.register("test-db", DbToolConfig.builder()
+        .jdbcUrl("jdbc:mysql://localhost:3306/demo")
+        .username("root")
+        .password("secret")
+        .build());
+List<AgentTool<?, ?>> dbTools = DbToolFactory.createDbTools(
+        DbToolConfig.builder()
+                .dataSource(manager.resolve("test-db"))
+                .build());
+```
+
+#### 5.3 直接调用示例
+
+```java
+ToolResult result = dbTools.get(1).executeSafely(
+        new QueryRequest("SELECT id, name FROM user WHERE status = 1", null));
+if (result.isSuccess()) {
+    QueryResult data = (QueryResult) result.getData();
+    System.out.println("列: " + data.columns());
+    System.out.println("行数: " + data.rowCount());
+}
+```
+
+#### 5.4 与 Agent 集成（HITL 写审批）
+
+```java
+ToolRegistry registry = new ToolRegistry(new SchemaGenerator());
+dbTools.forEach(registry::register);
+
+// execute_update 标记 requiresApproval=true：
+// AgentRunner 执行到写操作时抛出 AgentSuspendedException，
+// 人工审批后 agentRunner.resume(suspendId, ApprovalResult.approve(...)) 恢复执行
+```
+
+#### 5.5 Spring Boot 自动装配
+
+`application.yml`：
+
+```yaml
+realapex:
+  tool:
+    db:
+      jdbc-url: jdbc:mysql://localhost:3306/mydb
+      username: root
+      password: ${DB_PASSWORD}
+      dialect: mysql          # mysql / tdsql / gaussdb，留空自动探测
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout-ms: 5000
+      idle-timeout-ms: 60000
+      max-lifetime-ms: 1800000
+      keepalive-time-ms: 0
+      idle-ttl-minutes: 30
+      max-output-chars: 20000
+      query-timeout-seconds: 10
+      max-rows: 100
+      max-affected-rows: 500
+```
+
+自动注册 Bean：`dbToolConfig`（配置）、`dbTools`（5 个工具）、`readOnlySqlInterceptor`（只读拦截器）、`dbConnectionManager`（动态多数据源管理器）。
+
+#### 5.6 安全体系
+
+- **只读拦截**：`ReadOnlySqlInterceptor`（优先级 5）基于 JSqlParser 语法级解析，白名单 SELECT/SHOW/DESCRIBE/EXPLAIN，多语句（`;`）直接拦截
+- **写操作卡口**：仅允许 INSERT/UPDATE/DELETE；UPDATE/DELETE 必须带 WHERE；影响行数 ≤ 500
+- **方言防护**：TDSQL 分片键校验（shard_key/user_id 等）、GaussDB 高危函数检测
+- **超时强杀**：语句级 10s 超时；只读查询强制 LIMIT 100 行
+- **输出截断**：单工具返回 ≤ 20,000 字符
+- **HITL 审批**：`execute_update` 必须人工确认后才执行
+
+---
+
 ## ReAct 循环流程
 
 ```
@@ -410,6 +653,42 @@ AgentResult { finalText, totalSteps=2, totalUsage, stepResults }
 | `max-steps` | `10` | ReAct 循环最大步数，超步抛出 AgentMaxStepsExceededException |
 | `max-context-tokens` | `8000` | 触发上下文裁剪的 Token 阈值 |
 | `model` | — | 覆盖 ai-client-sdk 的默认模型 |
+
+### ai-tool-doc (`realapex.tool.doc.*`)
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `base-dir` | 当前工作目录 | 沙箱根目录（输入/输出路径统一限定） |
+| `output-dir` | `base-dir/output` | 渲染输出目录 |
+| `temp-dir` | `base-dir/temp` | URL/Base64 下载临时目录 |
+| `max-doc-size-bytes` | `20971520` | 输入文档大小上限（20MB） |
+| `max-output-chars` | `20000` | 返回结果截断上限 |
+| `max-pages` | `50` | PDF/Word 最大解析页数 |
+| `max-rows` | `100` | Excel 最大解析行数 |
+| `max-cols` | `50` | Excel 最大解析列数 |
+| `extract-images` | `true` | 是否提取文档内图片 |
+| `auto-upgrade-doc` | `true` | .doc 自动升级为 .docx |
+| `render-requires-approval` | `false` | 渲染是否触发 HITL 审批 |
+| `timeout-ms` | `30000` | 下载/解析超时（毫秒） |
+
+### ai-tool-db (`realapex.tool.db.*`)
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `jdbc-url` | — | 模式 B：JDBC URL（如 `jdbc:mysql://localhost:3306/mydb`） |
+| `username` / `password` | — | 模式 B：数据库账号密码 |
+| `dialect` | 自动探测 | 方言：`mysql` / `tdsql` / `gaussdb` |
+| `maximum-pool-size` | `5` | 连接池最大连接数（Agent 专用小池子） |
+| `minimum-idle` | `1` | 连接池最小空闲连接数 |
+| `connection-timeout-ms` | `5000` | 获取连接超时（毫秒） |
+| `idle-timeout-ms` | `60000` | 空闲回收超时（毫秒） |
+| `max-lifetime-ms` | `1800000` | 连接最大生命周期（毫秒，30 分钟） |
+| `keepalive-time-ms` | `0` | keepalive 时间（TDSQL 建议 30000） |
+| `idle-ttl-minutes` | `30` | 托管连接池空闲驱逐 TTL（分钟） |
+| `max-output-chars` | `20000` | 返回结果截断上限 |
+| `query-timeout-seconds` | `10` | 语句级查询超时（秒） |
+| `max-rows` | `100` | 只读查询最大返回行数 |
+| `max-affected-rows` | `500` | 写操作影响行数上限 |
 
 ---
 

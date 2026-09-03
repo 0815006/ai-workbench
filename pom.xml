@@ -53,6 +53,11 @@
                 <version>${spring-boot.version}</version>
             </dependency>
             <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot</artifactId>
+                <version>${spring-boot.version}</version>
+            </dependency>
+            <dependency>
                 <groupId>org.projectlombok</groupId>
                 <artifactId>lombok</artifactId>
                 <version>${lombok.version}</version>
@@ -114,6 +119,27 @@
                 <artifactId>junit-jupiter</artifactId>
                 <version>5.11.4</version>
                 <scope>test</scope>
+            </dependency>
+    
+            <!-- PostgreSQL JDBC 驱动：上下文持久化落盘 -->
+            <dependency>
+                <groupId>org.postgresql</groupId>
+                <artifactId>postgresql</artifactId>
+                <version>42.7.5</version>
+            </dependency>
+    
+            <!-- HikariCP 连接池：上下文持久化（兜底 Auto-DDL 场景） -->
+            <dependency>
+                <groupId>com.zaxxer</groupId>
+                <artifactId>HikariCP</artifactId>
+                <version>6.2.1</version>
+            </dependency>
+    
+            <!-- Spring JDBC：数据源访问抽象（trace 落盘） -->
+            <dependency>
+                <groupId>org.springframework</groupId>
+                <artifactId>spring-jdbc</artifactId>
+                <version>6.2.1</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

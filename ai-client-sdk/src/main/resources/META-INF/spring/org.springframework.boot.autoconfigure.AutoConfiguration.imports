@@ -1,1 +1,2 @@
 com.realapex.client.autoconfigure.AiSdkAutoConfiguration
+com.realapex.client.trace.LLMTraceAutoConfiguration

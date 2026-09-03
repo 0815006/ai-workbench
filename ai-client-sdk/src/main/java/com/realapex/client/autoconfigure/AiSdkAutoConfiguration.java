@@ -3,6 +3,8 @@ package com.realapex.client.autoconfigure;
 import com.realapex.client.client.AiClient;
 import com.realapex.client.client.impl.DefaultAiClient;
 import com.realapex.client.config.AiConfig;
+import com.realapex.client.trace.LLMInvokeTraceInterceptor;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -22,12 +24,14 @@ public class AiSdkAutoConfiguration {
     /**
      * 自动装配 AiClient Bean。
      *
-     * @param properties Spring Boot 配置属性
+     * @param properties        Spring Boot 配置属性
+     * @param traceInterceptor  Trace 拦截器（由 LLMTraceAutoConfiguration 提供，可能不存在）
      * @return AiClient 实例
      */
     @Bean
     @ConditionalOnMissingBean
-    public AiClient aiClient(AiSdkProperties properties) {
+    public AiClient aiClient(AiSdkProperties properties,
+                             ObjectProvider<LLMInvokeTraceInterceptor> traceInterceptor) {
         AiConfig config = AiConfig.builder()
                 .baseUrl(properties.getBaseUrl())
                 .apiKeys(properties.getApiKeys())
@@ -38,6 +42,7 @@ public class AiSdkAutoConfiguration {
                 .maxRetries(properties.getMaxRetries())
                 .retryBaseDelay(properties.getRetryBaseDelay())
                 .keyBlacklistDuration(properties.getKeyBlacklistDuration())
+                .traceInterceptor(traceInterceptor.getIfAvailable())
                 .build();
         return DefaultAiClient.create(config);
     }

@@ -22,6 +22,7 @@ import com.realapex.client.provider.ModelProviderFactory;
 import com.realapex.client.skill.BaseSkill;
 import com.realapex.client.stream.StreamEvent;
 import com.realapex.client.stream.StreamToolCallBuffer;
+import com.realapex.client.trace.LLMInvokeTraceInterceptor;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -55,6 +56,7 @@ public class DefaultAiClient implements AiClient {
     private final RetryHandler retryHandler;
     private final JsonRepairParser jsonRepairParser;
     private final ModelProvider modelProvider;
+    private final LLMInvokeTraceInterceptor traceInterceptor;
 
     /**
      * 私有构造器，通过 {@link #create(AiConfig)} 工厂方法创建。
@@ -74,6 +76,7 @@ public class DefaultAiClient implements AiClient {
                 config.getRetryBaseDelay());
         this.jsonRepairParser = new JsonRepairParser(objectMapper);
         this.modelProvider = ModelProviderFactory.create(config.getProvider());
+        this.traceInterceptor = config.getTraceInterceptor();
     }
 
     /**
@@ -118,33 +121,46 @@ public class DefaultAiClient implements AiClient {
         // 厂商协议适配（Ollama 等本地模型注入 Tool Prompt）
         AiRequest adaptedReq = modelProvider.adaptRequest(req);
 
-        return retryHandler.executeWithRetry(() -> {
-            try {
-                HttpRequest httpReq = buildHttpRequest(adaptedReq);
-                HttpResponse<String> httpResp = httpClient.send(
-                        httpReq, HttpResponse.BodyHandlers.ofString());
-                handleHttpError(httpResp);
-                AiResponse aiResp = objectMapper.readValue(
-                        httpResp.body(), AiResponse.class);
-                // 厂商响应降级解析（非标准 JSON 时回退）
-                AiResponse providerResp = modelProvider.parseResponse(httpResp.body());
-                if (providerResp != null) {
-                    aiResp = providerResp;
+        // Trace 拦截：开始（预插入 RUNNING）
+        LLMInvokeTraceInterceptor.TraceSession trace = traceBegin(request, "ASYNC_CHAT");
+
+        try {
+            AiResponse aiResp = retryHandler.executeWithRetry(() -> {
+                try {
+                    HttpRequest httpReq = buildHttpRequest(adaptedReq);
+                    HttpResponse<String> httpResp = httpClient.send(
+                            httpReq, HttpResponse.BodyHandlers.ofString());
+                    handleHttpError(httpResp);
+                    AiResponse resp = objectMapper.readValue(
+                            httpResp.body(), AiResponse.class);
+                    // 厂商响应降级解析（非标准 JSON 时回退）
+                    AiResponse providerResp = modelProvider.parseResponse(httpResp.body());
+                    if (providerResp != null) {
+                        resp = providerResp;
+                    }
+                    // 提取推理/思考链内容
+                    resp.setReasoningContent(modelProvider.extractReasoning(resp));
+                    log.debug("generate 完成, hasToolCalls={}, tokens={}, reasoning={}",
+                            resp.hasToolCalls(),
+                            resp.getUsage() != null ? resp.getUsage().getTotalTokens() : "N/A",
+                            resp.getReasoningContent() != null ? "yes" : "no");
+                    return resp;
+                } catch (IOException e) {
+                    throw new AiClientException("网络请求失败: " + e.getMessage(), e);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AiClientException("请求被中断", e);
                 }
-                // 提取推理/思考链内容
-                aiResp.setReasoningContent(modelProvider.extractReasoning(aiResp));
-                log.debug("generate 完成, hasToolCalls={}, tokens={}, reasoning={}",
-                        aiResp.hasToolCalls(),
-                        aiResp.getUsage() != null ? aiResp.getUsage().getTotalTokens() : "N/A",
-                        aiResp.getReasoningContent() != null ? "yes" : "no");
-                return aiResp;
-            } catch (IOException e) {
-                throw new AiClientException("网络请求失败: " + e.getMessage(), e);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AiClientException("请求被中断", e);
-            }
-        });
+            });
+
+            // Trace 拦截：成功结束（更新 SUCCESS）
+            traceSuccess(trace, aiResp);
+            return aiResp;
+        } catch (RuntimeException e) {
+            // Trace 拦截：失败结束（更新 FAILED）
+            traceFailure(trace, e);
+            throw e;
+        }
     }
 
     /**
@@ -159,14 +175,31 @@ public class DefaultAiClient implements AiClient {
         req.setStream(true);
         // 厂商协议适配（Ollama 等本地模型注入 Tool Prompt）
         req = modelProvider.adaptRequest(req);
-        return generateWithStreaming(req, listener);
+
+        // Trace 拦截：开始（预插入 RUNNING）
+        LLMInvokeTraceInterceptor.TraceSession trace = traceBegin(request, "STREAM");
+
+        try {
+            AiResponse response = generateWithStreaming(req, listener, trace);
+            traceSuccess(trace, response);
+            return response;
+        } catch (RuntimeException e) {
+            traceFailure(trace, e);
+            throw e;
+        }
     }
 
     /**
      * SSE 流式 LLM 调用——累积文本/工具调用/Token，同时通过 listener 实时推送。
-     * <p>内部阻塞处理完整个 SSE 流后才返回拼装好的完整 AiResponse。</p>
+     * <p>内部阻塞处理完整个 SSE 流后才返回拼装好的完整 AiResponse。
+     * 首个增量到达时通过拦截器记录 TTFT。</p>
+     *
+     * @param req         已经适配的请求
+     * @param listener    流式回调
+     * @param trace       可选的 Trace 会话（用于记录首 Token 延迟），可为 null
      */
-    private AiResponse generateWithStreaming(AiRequest req, StreamListener listener) {
+    private AiResponse generateWithStreaming(AiRequest req, StreamListener listener,
+                                             LLMInvokeTraceInterceptor.TraceSession trace) {
         try {
             HttpRequest httpReq = buildHttpRequest(req);
             HttpResponse<java.util.stream.Stream<String>> httpResp = httpClient.send(
@@ -185,6 +218,7 @@ public class DefaultAiClient implements AiClient {
             String[] finishReason = {null};
             String[] responseId = {null};
             String[] model = {null};
+            boolean[] firstTokenRecorded = {false};
 
             httpResp.body().forEach(line -> {
                 if (line.startsWith("data: ")) {
@@ -209,6 +243,14 @@ public class DefaultAiClient implements AiClient {
 
                             Choice.Delta delta = choice.getDelta();
                             if (delta != null) {
+                                // 首个 Token 到达 → 记录 TTFT
+                                if (!firstTokenRecorded[0] && (delta.getContent() != null
+                                        || delta.getReasoningContent() != null)) {
+                                    firstTokenRecorded[0] = true;
+                                    if (traceInterceptor != null && trace != null) {
+                                        traceInterceptor.onFirstToken(trace);
+                                    }
+                                }
                                 // 文本增量 → 累积 + 回调
                                 if (delta.getContent() != null) {
                                     fullText.append(delta.getContent());
@@ -461,6 +503,46 @@ public class DefaultAiClient implements AiClient {
     public <I, O> O executeSkill(BaseSkill<I, O> skill, I input) {
         log.debug("执行 Skill: {}", skill.getClass().getSimpleName());
         return skill.execute(this, input);
+    }
+
+    // ==================== Trace 拦截辅助 ====================
+
+    /**
+     * Trace 开始：通过可选拦截器预插入 RUNNING 日志。
+     *
+     * @param request  请求对象
+     * @param callType 调用类型
+     * @return Trace 会话，未启用 trace 或落盘失败时为 null
+     */
+    private LLMInvokeTraceInterceptor.TraceSession traceBegin(AiRequest request, String callType) {
+        if (traceInterceptor == null) {
+            return null;
+        }
+        return traceInterceptor.onStart(request, callType);
+    }
+
+    /**
+     * Trace 成功结束：通过可选拦截器异步更新为 SUCCESS。
+     *
+     * @param trace    Trace 会话
+     * @param response 完整响应
+     */
+    private void traceSuccess(LLMInvokeTraceInterceptor.TraceSession trace, AiResponse response) {
+        if (traceInterceptor != null) {
+            traceInterceptor.onSuccess(trace, response);
+        }
+    }
+
+    /**
+     * Trace 失败结束：通过可选拦截器异步更新为 FAILED。
+     *
+     * @param trace Trace 会话
+     * @param error 异常
+     */
+    private void traceFailure(LLMInvokeTraceInterceptor.TraceSession trace, Throwable error) {
+        if (traceInterceptor != null) {
+            traceInterceptor.onFailure(trace, error);
+        }
     }
 
     // ==================== 内部方法 ====================
