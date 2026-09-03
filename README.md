@@ -9,6 +9,8 @@
 | `ai-client-sdk` | 通信基座 | HTTP/SSE 传输、Tool Calling 协议、Key 轮询、重试熔断 |
 | `ai-tool-sdk` | 工具基座 | AgentTool 契约、@Tool/@ToolParam 注解、Schema 生成、安全沙箱 |
 | `ai-agent-sdk` | 编排引擎 | ReAct 循环、虚拟线程并发调度、Token 裁剪、生命周期事件 |
+| `ai-tool-doc` | 领域工具包 | 文档转换/模板渲染：Word/Excel/PDF 解析、模板填充 |
+| `ai-tool-db` | 领域工具包 | 数据库工具：Schema 探查、只读查询、EXPLAIN 诊断、慢查询抓取、受控写操作（HITL） |
 
 ## 技术亮点
 
@@ -420,7 +422,9 @@ ai-workbench/
  ├── pom.xml                <-- 父 POM
  ├── ai-client-sdk/         <-- 通信基座
  ├── ai-tool-sdk/           <-- 工具基座
- └── ai-agent-sdk/          <-- 编排引擎
+ ├── ai-agent-sdk/          <-- 编排引擎
+ ├── ai-tool-doc/           <-- 领域工具包：文档转换/模板渲染
+ └── ai-tool-db/            <-- 领域工具包：数据库工具（Schema/查询/EXPLAIN/慢日志/受控写）
 ```
 
 ## 构建

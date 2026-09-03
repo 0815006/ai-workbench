@@ -17,6 +17,7 @@
         <module>ai-tool-sdk</module>
         <module>ai-agent-sdk</module>
         <module>ai-tool-doc</module>
+        <module>ai-tool-db</module>
     </modules>
 
     <properties>
