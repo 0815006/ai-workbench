@@ -185,6 +185,61 @@ CompletableFuture<AiResponse> future = CompletableFuture.supplyAsync(() ->
 - 异步状态机、`trace_id` / `parent_log_id` 用于 Agent 子任务树状串联。
 - 内置 `created_at` 索引，便于应用侧定期清理/冷热分离大 JSONB。
 
+##### 状态机与异步追踪
+
+- 生命周期：`INIT → RUNNING → STREAMING → SUCCESS/FAILED`，SDK 自动流转：
+  - 调用开始前同步预插一条 `RUNNING` 记录并返回 `log_id`；
+  - 流式场景收到首个 Token 时记录 `first_token_latency_ms`（TTFT）；
+  - 结束后异步更新为 `SUCCESS` / `FAILED`（Tokens、耗时、响应载荷、错误堆栈），不阻塞主线程。
+- 树状串联：`trace_id` 全局唯一贯穿一次业务请求；Agent 拆解子任务时写入 `parent_log_id`，即可把多线程/多轮调用串成思考树。
+- 跨线程透传：`ThreadLocal` 无法跨线程，异步场景用 `LLMTraceContext.wrap(ctx, task)` 包装（线程池 / `CompletableFuture` 均适用），SDK 自动恢复与清理。
+
+##### 落盘内容（request_payload / response_payload）
+
+`request_payload` 记录模型收到请求时的全量上下文：
+
+```json
+{
+  "system_prompt": "你是一个资深的 PostgreSQL 性能诊断专家...",
+  "temperature": 0.2,
+  "top_p": 0.95,
+  "messages": [
+    { "role": "user", "content": "请帮我分析一下生产库这边的订单表索引情况。" },
+    { "role": "assistant", "content": "好的，我已经准备好了。", "tool_calls": [ ... ] }
+  ],
+  "tools": [
+    { "name": "get_db_schema", "description": "获取指定数据库方言下的表结构和索引定义", "parameters": { ... } }
+  ]
+}
+```
+
+`response_payload` 记录模型思考与执行全过程：
+
+```json
+{
+  "finish_reason": "stop",
+  "reasoning_content": "用户想要查询 t_order 的表结构，我应该先调用 get_db_schema...",
+  "assistant_message": { "role": "assistant", "content": "我已经为您获取到了 t_order 表的结构..." },
+  "tool_calls_executed": [
+    { "tool_name": "get_db_schema", "call_id": "call_99812", "arguments": { ... }, "result": { ... }, "execution_latency_ms": 120 }
+  ]
+}
+```
+
+##### JSONB 检索与调优
+
+- 全量上下文存于 JSONB，可直接用 SQL 检索特定工具调用或报错：
+
+```sql
+-- 查找所有调用了 get_db_schema 工具的日志
+SELECT log_id, latency_ms
+FROM sys_llm_invoke_log
+WHERE response_payload->'tool_calls_executed' @> '[{"tool_name": "get_db_schema"}]';
+```
+
+- 超长文档场景用 `ai.client.trace.max-payload-length` 截断（默认 10 万字符），避免单条 JSONB 过大。
+- 应用侧可定时清理/冷热分离：只保留近 30 天详细载荷，更早的日志清空大 JSONB 字段，仅保留 Token 统计与元数据。
+
 ---
 
 ### 2. ai-tool-sdk — 定义工具
